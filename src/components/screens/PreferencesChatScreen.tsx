@@ -25,7 +25,18 @@ export const PreferencesChatScreen: React.FC = () => {
   } = useApp();
 
   const AUDIENCES = ['Technical', 'General', 'Entrepreneurship'];
-  const TONES = ['Professional', 'Informative', 'Conversational', 'Educational'];
+  const TONES = [
+    'Professional',
+    'Bold & Punchy',
+    'Storytelling',
+    'Witty',
+    'Inspirational',
+    'Contrarian',
+    'Informative',
+    'Conversational',
+    'Educational'
+  ];
+  const HOOK_STYLES = ['Question', 'Statistic', 'Story', 'Myth-busting'];
   const LANGUAGES = ['English (US)', 'English (UK)', 'Spanish', 'French', 'German'];
   const OUTPUT_TYPES = ['Post', 'Audio', 'Video'];
   const OBJECTIVES = ['Inform', 'Educate', 'Engage', 'Summarize'];
@@ -341,6 +352,55 @@ export const PreferencesChatScreen: React.FC = () => {
                     );
                   })}
                 </div>
+              </div>
+            </div>
+
+            {/* Hook Style and Voice Sample Section */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-2 border-t border-[#EDF3EC]">
+              {/* Hook Style Selection */}
+              <div className="space-y-2">
+                <label className="block text-xs font-semibold text-gray-800">
+                  Opening Hook Style
+                </label>
+                <p className="text-[11px] text-gray-500">
+                  Choose how content opens across communication channels.
+                </p>
+                <div className="grid grid-cols-2 gap-2 pt-1">
+                  {HOOK_STYLES.map((hs) => {
+                    const isSelected = preferences.hookStyle === hs;
+                    return (
+                      <button
+                        key={hs}
+                        onClick={() => updatePreferences({ hookStyle: hs })}
+                        className={`text-left px-3 py-2 text-xs rounded-lg border transition-all ${
+                          isSelected
+                            ? 'border-[#8DBF67] bg-[#F2F8EE] text-[#2E5824] font-semibold shadow-xs'
+                            : 'border-[#E3ECE0] bg-white text-gray-700 font-normal hover:bg-gray-50'
+                        }`}
+                        type="button"
+                      >
+                        {hs}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Voice Sample Textarea */}
+              <div className="space-y-2">
+                <label className="block text-xs font-semibold text-gray-800">
+                  Writing Voice Sample (optional)
+                </label>
+                <p className="text-[11px] text-gray-500">
+                  Paste a sample of your writing. InfoMorph will adapt its pacing without copying facts.
+                </p>
+                <textarea
+                  value={preferences.voiceSample || ''}
+                  onChange={(e) => updatePreferences({ voiceSample: e.target.value })}
+                  placeholder="Paste 1-2 paragraphs of your writing here..."
+                  rows={3}
+                  className="w-full text-xs p-3 border border-[#DCE7D9] rounded-xl bg-white text-gray-800 placeholder-gray-400 focus:outline-none focus:ring-1 focus:ring-[#477A3C] focus:border-[#477A3C] font-mono leading-relaxed resize-none"
+                />
               </div>
             </div>
 

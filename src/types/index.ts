@@ -63,6 +63,18 @@ export interface QuestionnairePreferences {
   outputCategory: string; // 'Post' | 'Audio' | 'Video'
   objective: string;
   selectedFormats: OutputType[];
+  hookStyle?: 'Question' | 'Statistic' | 'Story' | 'Myth-busting' | string;
+  voiceSample?: string;
+}
+
+export interface TrendSignal {
+  phrase: string;
+  source: string;
+}
+
+export interface FailedFormatItem {
+  outputType: OutputType;
+  error: string;
 }
 
 // Alias for backwards compatibility with API routes

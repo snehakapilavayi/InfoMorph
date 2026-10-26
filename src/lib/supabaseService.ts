@@ -120,6 +120,27 @@ export async function saveSourceOfTruth(sourceId: string, sot: SourceOfTruth): P
 /**
  * Save generated multi-channel outputs & claims
  */
+/**
+ * Format an OutputItem for insertion into the Supabase outputs table.
+ */
+export function formatOutputForSupabase(item: OutputItem, projectId?: string, sourceId?: string) {
+  return {
+    project_id: projectId || null,
+    source_id: sourceId || null,
+    output_type: item.outputType,
+    title: item.title,
+    subtitle: item.subtitle,
+    content: item.content,
+    quality_score: item.qualityScore,
+    character_count: item.characterCount,
+    grounded_percent: item.groundedPercent,
+    status: item.status,
+    published_at: item.publishedAt ? new Date().toISOString() : null,
+    hashtags: item.hashtags || [],
+    metadata: item.metadata || {}
+  };
+}
+
 export async function saveGeneratedOutputs(
   outputs: OutputItem[],
   projectId?: string,
@@ -131,23 +152,7 @@ export async function saveGeneratedOutputs(
     for (const item of outputs) {
       const { data: outputRecord, error: outputError } = await supabase
         .from('outputs')
-        .insert([
-          {
-            project_id: projectId || null,
-            source_id: sourceId || null,
-            output_type: item.outputType,
-            title: item.title,
-            subtitle: item.subtitle,
-            content: item.content,
-            quality_score: item.qualityScore,
-            character_count: item.characterCount,
-            grounded_percent: item.groundedPercent,
-            status: item.status,
-            published_at: item.publishedAt ? new Date().toISOString() : null,
-            hashtags: item.hashtags || [],
-            metadata: item.metadata || {}
-          }
-        ])
+        .insert([formatOutputForSupabase(item, projectId, sourceId)])
         .select('id')
         .single();
 

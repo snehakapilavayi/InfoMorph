@@ -120,7 +120,9 @@ export const DEFAULT_PREFERENCES: QuestionnairePreferences = {
     'blog',
     'whatsapp',
     'twitter'
-  ]
+  ],
+  hookStyle: 'Statistic',
+  voiceSample: ''
 };
 
 export const INITIAL_OUTPUTS: OutputItem[] = [

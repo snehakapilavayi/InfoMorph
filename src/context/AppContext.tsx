@@ -10,7 +10,8 @@ import {
   SourceOfTruth,
   QuestionnairePreferences,
   AuditLog,
-  VerificationResult
+  VerificationResult,
+  FailedFormatItem
 } from '@/types';
 import { DEFAULT_PREFERENCES } from '@/lib/mockData';
 import { tokenizeTextIntoSpans } from '@/lib/tokenizer';
@@ -40,6 +41,8 @@ interface AppContextType {
   updatePreferences: (patch: Partial<QuestionnairePreferences>) => void;
   toggleFormat: (format: OutputType) => void;
   outputs: OutputItem[];
+  failedFormats: FailedFormatItem[];
+  retryFailedFormat: (format: OutputType) => Promise<void>;
   activeOutput: OutputItem | null;
   setActiveOutput: (output: OutputItem | null) => void;
   updateOutputContent: (outputId: string, content: string) => void;
@@ -73,6 +76,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [activeSource, setActiveSource] = useState<SourceCorpusItem | null>(null);
   const [preferences, setPreferences] = useState<QuestionnairePreferences>(DEFAULT_PREFERENCES);
   const [outputs, setOutputs] = useState<OutputItem[]>([]);
+  const [failedFormats, setFailedFormats] = useState<FailedFormatItem[]>([]);
   const [activeOutput, setActiveOutput] = useState<OutputItem | null>(null);
   const [projects, setProjects] = useState<ProjectItem[]>([]);
   const [sot, setSot] = useState<SourceOfTruth | null>(null);
@@ -233,13 +237,36 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const updateOutputContent = (outputId: string, content: string) => {
+    // Invalidate verification status if factual text is modified
     setOutputs(prev =>
-      prev.map(o => (o.id === outputId ? { ...o, content, characterCount: content.length } : o))
+      prev.map(o => {
+        if (o.id !== outputId) return o;
+        return {
+          ...o,
+          content,
+          characterCount: content.length,
+          qualityScore: null,
+          groundedPercent: null,
+          claims: (o.claims || []).map(c => ({
+            ...c,
+            status: 'unsupported' as const,
+            contradictionFlag: false,
+            contradictionDetails: undefined
+          }))
+        };
+      })
     );
     if (activeOutput && activeOutput.id === outputId) {
-      setActiveOutput(prev => prev ? ({ ...prev, content, characterCount: content.length }) : null);
+      setActiveOutput(prev => prev ? ({
+        ...prev,
+        content,
+        characterCount: content.length,
+        qualityScore: null,
+        groundedPercent: null
+      }) : null);
     }
-    addToast('Changes saved', 'info');
+    setVerificationResult(null);
+    addToast('Changes saved. Verification invalidated due to edit.', 'info');
   };
 
   const copyOutput = (content: string) => {
@@ -276,7 +303,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     setIsGenerating(true);
     setGenerationError(null);
-    addToast('Generating grounded content with Gemini...', 'info');
+    setFailedFormats([]);
+    addToast('Generating grounded content with Gemini in parallel...', 'info');
 
     try {
       let currentSot = sot;
@@ -309,18 +337,26 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         throw new Error(errJson.details || errJson.error || 'Generation failed');
       }
 
-      const { outputs: generatedOutputs } = await genRes.json();
+      const genData = await genRes.json();
+      const generatedOutputs = genData.outputs || [];
+      const failed = genData.failedFormats || [];
 
-      if (!generatedOutputs || generatedOutputs.length === 0) {
-        throw new Error('No outputs were returned by Gemini');
+      setFailedFormats(failed);
+
+      if (generatedOutputs.length === 0 && failed.length > 0) {
+        throw new Error(`All requested format generations failed: ${failed.map((f: any) => `${f.outputType} (${f.error})`).join('; ')}`);
       }
 
       setOutputs(generatedOutputs);
-      setActiveOutput(generatedOutputs[0]);
+      if (generatedOutputs.length > 0) {
+        setActiveOutput(generatedOutputs[0]);
+      }
       setGenerationError(null);
 
-      // Save to Supabase
-      await saveGeneratedOutputs(generatedOutputs, undefined, activeSource.id);
+      // Save successful outputs to Supabase
+      if (generatedOutputs.length > 0) {
+        await saveGeneratedOutputs(generatedOutputs, undefined, activeSource.id);
+      }
 
       // Audit Log
       const modelLabel = generatedOutputs[0]?.modelUsed
@@ -330,13 +366,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         category: 'generation' as const,
         action: 'Outputs Formatted & Grounded',
-        details: `Generated ${generatedOutputs.length} channels with ${modelLabel}. Grounding verified against "${activeSource.name}".`,
-        status: 'success' as const
+        details: `Generated ${generatedOutputs.length} channels with ${modelLabel} (${failed.length} failed). Grounding verified against "${activeSource.name}".`,
+        status: failed.length > 0 ? ('warning' as const) : ('success' as const)
       };
       setAuditLogs(prev => [{ id: `log-${Date.now()}`, ...log }, ...prev]);
       await logAuditEventToSupabase(log);
 
-      addToast(`${generatedOutputs.length} channels generated and saved to Supabase!`, 'success');
+      if (failed.length > 0) {
+        addToast(`${generatedOutputs.length} succeeded, ${failed.length} failed (retry available).`, 'warning');
+      } else {
+        addToast(`${generatedOutputs.length} channels generated and saved to Supabase!`, 'success');
+      }
       setActiveNav('outputs');
     } catch (err: any) {
       console.error('Generation failure:', err);
@@ -346,6 +386,69 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setActiveNav('outputs');
     } finally {
       setIsGenerating(false);
+    }
+  };
+
+  const retryFailedFormat = async (format: OutputType) => {
+    if (!activeSource) {
+      addToast('No active source available to retry', 'warning');
+      return;
+    }
+
+    addToast(`Retrying generation for ${format}...`, 'info');
+    try {
+      let currentSot = sot;
+      if (!currentSot) {
+        const understandRes = await fetch('/api/pipeline/understand', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ rawText: activeSource.rawText })
+        });
+        if (understandRes.ok) {
+          const data = await understandRes.json();
+          currentSot = data.sot;
+          setSot(currentSot);
+        }
+      }
+
+      const genRes = await fetch('/api/pipeline/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sot: currentSot,
+          spans: activeSource.spans || [],
+          config: preferences,
+          singleFormat: format
+        })
+      });
+
+      const genData = await genRes.json();
+      if (!genRes.ok) {
+        throw new Error(genData.error || `Retry failed for ${format}`);
+      }
+
+      const retriedOutputs = genData.outputs || [];
+      const failed = genData.failedFormats || [];
+
+      if (retriedOutputs.length > 0) {
+        const newOutput = retriedOutputs[0];
+        setOutputs(prev => {
+          const exists = prev.some(o => o.outputType === format);
+          if (exists) {
+            return prev.map(o => o.outputType === format ? newOutput : o);
+          }
+          return [...prev, newOutput];
+        });
+        setActiveOutput(newOutput);
+        setFailedFormats(prev => prev.filter(f => f.outputType !== format));
+        addToast(`Successfully regenerated ${format}!`, 'success');
+        await saveGeneratedOutputs([newOutput], undefined, activeSource.id);
+      } else if (failed.length > 0) {
+        throw new Error(failed[0].error || `Retry failed for ${format}`);
+      }
+    } catch (err: any) {
+      console.error('Retry failed:', err);
+      addToast(err.message || `Retry failed for ${format}`, 'warning');
     }
   };
 
@@ -419,6 +522,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         updatePreferences,
         toggleFormat,
         outputs,
+        failedFormats,
+        retryFailedFormat,
         activeOutput,
         setActiveOutput,
         updateOutputContent,

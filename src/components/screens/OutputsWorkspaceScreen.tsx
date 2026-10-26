@@ -35,6 +35,8 @@ export const OutputsWorkspaceScreen: React.FC = () => {
   const {
     activeSource,
     outputs,
+    failedFormats,
+    retryFailedFormat,
     activeOutput,
     setActiveOutput,
     updateOutputContent,
@@ -277,6 +279,34 @@ export const OutputsWorkspaceScreen: React.FC = () => {
               Here are your generated outputs. Review, edit or publish them.
             </p>
           </div>
+
+          {/* Failed Formats Retry Banner */}
+          {failedFormats && failedFormats.length > 0 && (
+            <div className="flex flex-col gap-2.5">
+              {failedFormats.map((failed) => (
+                <div
+                  key={failed.outputType}
+                  className="flex items-center justify-between p-3.5 bg-amber-50/80 border border-amber-200/80 rounded-xl text-xs text-amber-900 shadow-2xs"
+                >
+                  <div className="flex items-center gap-2.5">
+                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                    <div>
+                      <span className="font-bold capitalize">{failed.outputType}</span> output failed:{' '}
+                      <span className="text-amber-800">{failed.error}</span>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => retryFailedFormat(failed.outputType)}
+                    disabled={isGenerating}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white rounded-lg font-semibold tracking-wide transition shadow-2xs cursor-pointer shrink-0 ml-2"
+                  >
+                    <RotateCcw className={`w-3 h-3 ${isGenerating ? 'animate-spin' : ''}`} />
+                    <span>Retry Format</span>
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
 
           {/* Cards Grid */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-1">

@@ -8,12 +8,16 @@ import {
   OutputItem,
   ClaimItem,
   ContradictionItem,
-  VerificationResult
+  VerificationResult,
+  TrendSignal,
+  FailedFormatItem
 } from '@/types';
 import {
   calculateStoryboardTimestamps,
   calculateAudioDuration
 } from '@/lib/timeUtils';
+import { humanizeText } from './humanize';
+import { getTopicTrendSignals } from './trends';
 
 // Candidates are not verified until a generation request succeeds.
 const CANDIDATE_MODELS = [
@@ -254,6 +258,24 @@ function parseOutputs(text: string, spans: SourceSpan[], selectedTypes: OutputTy
   return parsed;
 }
 
+function parseSingleOutput(
+  text: string,
+  spans: SourceSpan[],
+  expectedType: OutputType
+): GeneratedOutput {
+  const parsed = parseStructuredJson<GeneratedOutput>(text, generatedOutputSchema);
+  parsed.outputType = expectedType;
+  if (!parsed.title?.trim() || !parsed.content?.trim()) {
+    throw new Error(`Gemini ${expectedType} output has empty required text`);
+  }
+  const validIds = new Set(spans.map(span => span.id));
+  for (const claim of parsed.claims || []) {
+    claim.outputType = expectedType;
+    validateReferences(claim.sourceSpanIds, validIds, 'claims.sourceSpanIds');
+  }
+  return parsed;
+}
+
 function getThematicImageUrl(text: string): string {
   const lower = text.toLowerCase();
   if (lower.includes('cyber') || lower.includes('security') || lower.includes('vulnerability') || lower.includes('hack')) {
@@ -351,138 +373,301 @@ ${indexedContent}`;
   }
 
   /**
-   * Stage 2: Coordinated Multi-Format Generation from Shared Source of Truth
+   * Stage 2: Specialized Single-Format Content Generation
+   */
+  async generateSingleFormatOutput(
+    sot: SourceOfTruth,
+    spans: SourceSpan[],
+    config: QuestionnairePreferences,
+    format: OutputType,
+    trendSignals: TrendSignal[] = []
+  ): Promise<OutputItem> {
+    if (!this.client) {
+      throw new Error('Gemini API key is not configured; no synthetic content returned.');
+    }
+
+    const indexedContent = spans.map(s => `[${s.id}] ${s.text}`).join('\n');
+
+    let platformInstructions = '';
+    let hashtagGuidance = '';
+
+    switch (format) {
+      case 'instagram':
+        platformInstructions = `Format strictly as a high-engagement Instagram Post:
+- Opening: An irresistible single-line hook using the "${config.hookStyle || 'Statistic'}" style.
+- Body: 3-4 clean, bulleted deep takeaways (derive complete, articulate sentences from Source of Truth).
+- Closing: A thoughtful community question and clear call to action.
+- Constraints: NEVER format as a carousel, NEVER mention "Carousel" or "Slide", and NEVER include document artifacts or page numbers.`;
+        hashtagGuidance = `Generate between 5 and 8 targeted, highly relevant hashtags matching the topic and tone.`;
+        break;
+
+      case 'whatsapp':
+        platformInstructions = `Format as a high-priority, executive WhatsApp Channel bulletin:
+- Opening: Urgent/authoritative headline tagged with emoji, opening directly with a "${config.hookStyle || 'Statistic'}" hook.
+- Body: Concise, high-density bulleted brief. Use *bold* for key terms and metrics. No markdown headers (# or ##).
+- Closing: Clear next action or verification signoff.`;
+        hashtagGuidance = `WhatsApp does not use hashtags naturally. Omit all hashtags (return empty array []).`;
+        break;
+
+      case 'linkedin':
+        platformInstructions = `Format as an insightful LinkedIn Thought Leadership Post:
+- Opening: A strong observation or perspective using the "${config.hookStyle || 'Statistic'}" style.
+- Body: Structured narrative paragraphs with white space, breaking down strategic implications.
+- Closing: Strategic discussion prompt for professionals.`;
+        hashtagGuidance = `Generate between 2 and 3 professional, focused industry hashtags.`;
+        break;
+
+      case 'twitter':
+        platformInstructions = `Format as a punchy, high-impact Post for X / Twitter:
+- Opening: Direct, curiosity-inducing hook using the "${config.hookStyle || 'Statistic'}" style.
+- Body: Crisp core finding with verified quantitative metrics.
+- Closing: Engaging conclusion or discussion prompt.`;
+        hashtagGuidance = `Generate exactly 1 or 2 high-relevance hashtags.`;
+        break;
+
+      case 'blog':
+        platformInstructions = `Format as a well-structured authoritative Blog / Editorial Article:
+- Title & Subtitle: Engaging and descriptive.
+- Introduction: Sets up context and stakes with a "${config.hookStyle || 'Statistic'}" hook.
+- Body: 2-3 logical sub-sections discussing core facts, evidence, and critical metrics.
+- Conclusion: Forward-looking summary and implications.`;
+        hashtagGuidance = `Blogs do not use social hashtags naturally. Return empty array [].`;
+        break;
+
+      case 'youtube':
+        platformInstructions = `Format as an articulate YouTube Video Script Outline:
+- Structure: Clear scene-by-scene script outline with visual description and narration.
+- Opening: High-energy teaser using the "${config.hookStyle || 'Statistic'}" hook.
+- Storyboard: Include 3-5 sequential scenes with narration and visual cues.`;
+        hashtagGuidance = `Omit hashtags or provide up to 3 broad tags.`;
+        break;
+    }
+
+    const voiceGuidance = config.voiceSample?.trim()
+      ? `\nVOICE SAMPLE ADAPTATION:
+Mirror the sentence rhythm, cadence, phrasing, and vocabulary density of this user voice sample:
+"""
+${config.voiceSample.trim()}
+"""
+CRITICAL: Do NOT copy facts, company names, or topics from the sample. Apply ONLY its stylistic rhythm and vocabulary patterns to the Source of Truth.`
+      : '';
+
+    const trendGuidance = trendSignals.length > 0
+      ? `\nTREND CONTEXT SIGNALS (from search telemetry):
+Related phrases: ${trendSignals.map(t => `"${t.phrase}"`).join(', ')}.
+Use these phrases strictly for topical framing and hashtag selection. NEVER introduce ungrounded factual claims from search signals.`
+      : '';
+
+    const prompt = `You are the InfoMorph Content Intelligence Engine specializing in platform-native transformation.
+Transform the provided Source of Truth into a ready-to-publish ${format.toUpperCase()} output.
+
+CONFIGURATION:
+- Target Audience: ${config.audience}
+- Tone: ${config.tone}
+- Language: ${config.language}
+- Output Category: ${config.outputCategory}
+- Objective: ${config.objective}
+- Hook Style: ${config.hookStyle || 'Statistic'}
+
+PLATFORM SPECIFICATIONS:
+${platformInstructions}
+
+HASHTAG RULES:
+${hashtagGuidance}
+${voiceGuidance}
+${trendGuidance}
+
+HUMAN WRITING GUIDANCE:
+- Write naturally with varied sentence lengths (avoid monotonous rhythm).
+- Avoid robotic endings, filler intros, and AI clichés like "delve", "game-changer", "let's dive in", or "in today's fast-paced world".
+- Do not use unnecessary em dashes.
+- Ground every factual assertion strictly in the Source of Truth.
+
+Return valid JSON matching this schema:
+{
+  "outputType": "${format}",
+  "title": "string",
+  "subtitle": "string",
+  "content": "string",
+  "characterCount": 400,
+  "claims": [{"id": "c1", "outputType": "${format}", "claimText": "string", "sourceSpanIds": ["S1"], "grounded": true, "contradictionFlag": false}],
+  "hashtags": ["string"],
+  "imageUrl": "string",
+  "storyboard": [{"timestamp": "0:00 - 0:15", "title": "string", "visualDescription": "string", "narration": "string"}]
+}
+
+SOURCE OF TRUTH:
+${JSON.stringify(sot)}
+
+SOURCE EVIDENCE SPANS:
+${indexedContent}`;
+
+    const { response, model: modelUsed } = await callGeminiWithModelFallback(
+      this.client,
+      {
+        contents: prompt,
+        config: {
+          responseMimeType: 'application/json',
+          responseJsonSchema: generatedOutputSchema,
+          temperature: 0.2
+        }
+      },
+      this.apiKey || '',
+      text => {
+        parseSingleOutput(text, spans, format);
+      }
+    );
+
+    const parsed = parseSingleOutput(response.text || '', spans, format);
+
+    // Apply humanization to generated content
+    let finalContent = humanizeText(parsed.content || '', format);
+    let finalTitle = parsed.title;
+
+    if (format === 'instagram') {
+      finalTitle = 'Instagram Post';
+      finalContent = finalContent
+        .replace(/^Carousel:\s*/i, '')
+        .replace(/Slide \d+:\s*/gi, '• ')
+        .replace(/(?:Page|CHAPTER)\s+\d+(?:\s+of\s+\d+)?\.{0,3}/gi, '')
+        .trim();
+    }
+
+    const defaultImg = getThematicImageUrl(sot.summary + ' ' + (sot.coreFacts[0]?.statement || ''));
+    const isAudio = config.outputCategory === 'Audio';
+    const isVideo = config.outputCategory === 'Video';
+
+    const defaultStoryboardRaw = [
+      {
+        title: 'Scene 1: Executive Overview',
+        visualDescription: 'Kinetic title sequence introducing the primary document headline.',
+        narration: sot.summary
+      },
+      {
+        title: 'Scene 2: Core Evidence & Grounded Findings',
+        visualDescription: 'Animated highlight callouts emphasizing key source fact statements.',
+        narration: sot.coreFacts.map(f => f.statement).join(' ') || sot.summary
+      },
+      {
+        title: 'Scene 3: Quantitative Metrics & Analysis',
+        visualDescription: 'Data cards highlighting verified metrics and operational shifts.',
+        narration: sot.criticalMetrics.map(m => `Figure: ${m.value} for ${m.label}`).join('. ') || 'All metrics grounded.'
+      },
+      {
+        title: 'Scene 4: Strategic Takeaways',
+        visualDescription: 'High-impact conclusion card with InfoMorph verification seal.',
+        narration: 'Canonical transformation verified against primary grounding references.'
+      }
+    ];
+
+    const calculatedStoryboard = calculateStoryboardTimestamps(
+      parsed.storyboard && parsed.storyboard.length > 0 ? parsed.storyboard : defaultStoryboardRaw
+    );
+    const calculatedAudioDuration = calculateAudioDuration(finalContent, 140);
+    const calculatedVideoDuration =
+      calculatedStoryboard[calculatedStoryboard.length - 1]?.timestamp.split(' - ')[1] || '1:15';
+
+    return {
+      ...parsed,
+      id: `out-${format}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      outputType: format,
+      title: finalTitle,
+      content: finalContent,
+      characterCount: finalContent.length,
+      qualityScore: null,
+      groundedPercent: null,
+      isFallback: false,
+      modelUsed,
+      status: 'ready' as const,
+      imageUrl: parsed.imageUrl || defaultImg,
+      mediaType: isAudio ? 'audio' : isVideo || format === 'youtube' ? 'video' : 'post',
+      audioDuration: calculatedAudioDuration,
+      videoDuration: calculatedVideoDuration,
+      storyboard: calculatedStoryboard,
+      hashtags: parsed.hashtags || []
+    };
+  }
+
+  /**
+   * Stage 2: Parallel Coordinated Multi-Format Generation
+   * Uses Promise.allSettled with concurrency limiting (2 concurrent requests) to protect quota.
    */
   async generateCoordinatedOutputs(
     sot: SourceOfTruth,
     spans: SourceSpan[],
     config: QuestionnairePreferences,
     selectedTypes: OutputType[]
-  ): Promise<OutputItem[]> {
+  ): Promise<{
+    outputs: OutputItem[];
+    failedFormats: FailedFormatItem[];
+  }> {
     if (!this.client) {
       throw new Error('Gemini API key is not configured; no synthetic content returned.');
     }
 
+    if (!selectedTypes || selectedTypes.length === 0) {
+      return { outputs: [], failedFormats: [] };
+    }
+
+    // 1. Fetch trend signals once for the entire source topic (cached for 6 hours)
+    let trendSignals: TrendSignal[] = [];
     try {
-      const prompt = `You are the InfoMorph Coordinated Content Transformation Engine.
-Transform the provided Source of Truth into the requested communication formats.
-ALL formats MUST be generated from this identical context so they are mutually consistent without factual drift.
-
-Configuration:
-- Target Audience: ${config.audience}
-- Tone: ${config.tone}
-- Language: ${config.language}
-- Output Type: ${config.outputCategory}
-- Objective: ${config.objective}
-
-Requested Formats: ${selectedTypes.join(', ')}
-Source of Truth: ${JSON.stringify(sot)}
-Source spans: ${JSON.stringify(spans)}
-
-Return exactly one output for each requested format. Every factual claim must reference the provided source span IDs. Never invent span IDs. Claims must use the same outputType as their containing output.
-
-Format Rules:
-- For "instagram": Format strictly as a high-engagement, ready-to-publish "Instagram Post". Begin with an attention-grabbing hook, provide 3-4 bulleted deep takeaways (complete, articulate sentences), and close with an engaging question and relevant hashtags. NEVER format as a carousel, NEVER mention "Carousel" or "Slide", and NEVER include page numbers or document headers.
-- For "youtube": Include sequential chapter timestamps calculated based on section lengths.
-
-Return JSON:
-{
-  "outputs": [
-    {
-      "outputType": "instagram | youtube | linkedin | blog | whatsapp | twitter",
-      "title": "string",
-      "subtitle": "string",
-      "content": "string",
-      "characterCount": 400,
-      "claims": [{"id": "c1", "outputType": "linkedin", "claimText": "string", "sourceSpanIds": ["S1"], "grounded": true, "contradictionFlag": false}]
+      const topic = sot.summary?.split('.')[0] || sot.entities?.[0]?.name || 'Technology';
+      const trends = await getTopicTrendSignals(topic);
+      trendSignals = trends.trendSignals || [];
+    } catch (e) {
+      console.warn('Trend lookup skipped: ' + sanitizedError(e, this.apiKey || ''));
     }
-  ]
-}`;
 
-      const { response, model: modelUsed } = await callGeminiWithModelFallback(this.client, {
-        contents: prompt,
-        config: {
-          responseMimeType: 'application/json',
-          responseJsonSchema: generatedOutputsSchema,
-          temperature: 0.2
+    // 2. Concurrency-limited execution pool (max 2 at a time) to prevent Gemini quota exhaustion
+    const CONCURRENCY_LIMIT = 2;
+    const settledResults: Array<{ format: OutputType; result: PromiseSettledResult<OutputItem> }> = [];
+
+    let index = 0;
+    const worker = async () => {
+      while (index < selectedTypes.length) {
+        const i = index++;
+        const format = selectedTypes[i];
+        try {
+          const out = await this.generateSingleFormatOutput(sot, spans, config, format, trendSignals);
+          settledResults.push({ format, result: { status: 'fulfilled', value: out } });
+        } catch (err: any) {
+          const cleanErr = sanitizedError(err, this.apiKey || '');
+          console.warn(`Format ${format} generation attempt failed: ${cleanErr}`);
+          settledResults.push({ format, result: { status: 'rejected', reason: new Error(cleanErr) } });
         }
-      }, this.apiKey || '', text => { parseOutputs(text, spans, selectedTypes); });
+      }
+    };
 
-      const parsed = parseOutputs(response.text || '', spans, selectedTypes);
+    const workers = Array.from(
+      { length: Math.min(CONCURRENCY_LIMIT, selectedTypes.length) },
+      () => worker()
+    );
+    await Promise.all(workers);
 
-      const defaultImg = getThematicImageUrl(sot.summary + ' ' + (sot.coreFacts[0]?.statement || ''));
-      const isAudio = config.outputCategory === 'Audio';
-      const isVideo = config.outputCategory === 'Video';
+    const outputs: OutputItem[] = [];
+    const failedFormats: FailedFormatItem[] = [];
 
-      const defaultStoryboardRaw = [
-        {
-          title: 'Scene 1: Executive Overview',
-          visualDescription: 'Kinetic title sequence introducing the primary document headline.',
-          narration: sot.summary
-        },
-        {
-          title: 'Scene 2: Core Evidence & Grounded Findings',
-          visualDescription: 'Animated highlight callouts emphasizing key source fact statements.',
-          narration: sot.coreFacts.map(f => f.statement).join(' ') || sot.summary
-        },
-        {
-          title: 'Scene 3: Quantitative Metrics & Analysis',
-          visualDescription: 'Data cards highlighting verified metrics and operational shifts.',
-          narration:
-            sot.criticalMetrics.map(m => `Figure: ${m.value} for ${m.label}`).join('. ') ||
-            'All metrics grounded.'
-        },
-        {
-          title: 'Scene 4: Strategic Takeaways',
-          visualDescription: 'High-impact conclusion card with InfoMorph verification seal.',
-          narration: 'Canonical transformation verified against primary grounding references.'
-        }
-      ];
-
-      const defaultStoryboard = calculateStoryboardTimestamps(defaultStoryboardRaw);
-
-      return parsed.outputs.map(o => {
-        let finalTitle = o.title;
-        let finalContent = o.content || '';
-        if (o.outputType === 'instagram') {
-          finalTitle = 'Instagram Post';
-          finalContent = finalContent
-            .replace(/^Carousel:\s*/i, '')
-            .replace(/Slide \d+:\s*/gi, '• ')
-            .replace(/(?:Page|CHAPTER)\s+\d+(?:\s+of\s+\d+)?\.{0,3}/gi, '')
-            .trim();
-        }
-
-        const calculatedStoryboard = calculateStoryboardTimestamps(
-          o.storyboard && o.storyboard.length > 0 ? o.storyboard : defaultStoryboard
-        );
-        const calculatedAudioDuration = calculateAudioDuration(finalContent, 140);
-        const calculatedVideoDuration =
-          calculatedStoryboard[calculatedStoryboard.length - 1]?.timestamp.split(' - ')[1] || '1:15';
-
-        return {
-          ...o,
-          id: `out-${o.outputType}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-          title: finalTitle,
-          content: finalContent,
-          characterCount: finalContent.length,
-          qualityScore: null,
-          groundedPercent: null,
-          isFallback: false,
-          modelUsed,
-          status: 'ready' as const,
-          imageUrl: o.imageUrl || defaultImg,
-          mediaType: isAudio ? 'audio' : isVideo || o.outputType === 'youtube' ? 'video' : 'post',
-          audioDuration: calculatedAudioDuration,
-          videoDuration: calculatedVideoDuration,
-          storyboard: calculatedStoryboard
-        };
-      });
-    } catch (err) {
-      const message = sanitizedError(err, this.apiKey || '');
-      console.error('Gemini coordinated generation failed: ' + message);
-      throw new Error(message);
+    for (const { format, result } of settledResults) {
+      if (result.status === 'fulfilled') {
+        outputs.push(result.value);
+      } else {
+        failedFormats.push({
+          outputType: format,
+          error: result.reason?.message || `Failed to generate ${format}`
+        });
+      }
     }
+
+    // If all formats failed, throw explicit error
+    if (outputs.length === 0 && failedFormats.length > 0) {
+      throw new Error(`All requested format generations failed: ${failedFormats.map(f => `${f.outputType} (${f.error})`).join('; ')}`);
+    }
+
+    return {
+      outputs,
+      failedFormats
+    };
   }
 
   /**
@@ -824,7 +1009,8 @@ Return ONLY valid JSON matching this schema:
 
     let overallConsistencyScore: number | null = null;
     if (outputs.length < 2) {
-      overallConsistencyScore = 100;
+      // For single-output cases, cross-output consistency is not applicable (null)
+      overallConsistencyScore = null;
     } else {
       const highCount = contradictions.filter(c => c.severity === 'high').length;
       const medCount = contradictions.filter(c => c.severity === 'medium').length;
