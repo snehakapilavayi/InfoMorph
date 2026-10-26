@@ -1,197 +1,257 @@
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, GenerateContentParameters, GenerateContentResponse } from '@google/genai';
+import { createHash } from 'node:crypto';
 import {
   SourceSpan,
   SourceOfTruth,
   QuestionnairePreferences,
   OutputType,
   OutputItem,
+  ClaimItem,
+  ContradictionItem,
   VerificationResult
 } from '@/types';
 import {
   calculateStoryboardTimestamps,
-  calculateAudioDuration,
-  estimateSpokenDurationSeconds,
-  formatSecondsToTime
+  calculateAudioDuration
 } from '@/lib/timeUtils';
 
+// Candidates are not verified until a generation request succeeds.
 const CANDIDATE_MODELS = [
-  'gemini-2.5-flash',
-  'gemini-1.5-flash',
-  'gemini-2.0-flash',
-  'gemini-3.6-flash'
+  'models/gemini-3.5-flash', 'models/gemini-3.5-flash-lite',
+  'models/gemini-3.6-flash', 'models/gemini-3.7-flash',
+  'models/gemini-3.8-flash', 'models/gemini-3-flash-preview'
 ];
+const MAX_MODEL_ATTEMPTS = 6;
+const modelDiscoveryCache = new Map<string, { expiresAt: number; models: Promise<string[]> }>();
+
+function sanitizedError(error: unknown, apiKey = ''): string {
+  const err = error as { message?: unknown; cause?: { code?: unknown; message?: unknown } } | null;
+  let message = String(err?.message ?? error);
+  if (err?.cause) message += ' (' + String(err.cause.code ?? '') + ': ' + String(err.cause.message ?? '') + ')';
+  const secrets = [apiKey, ...Object.entries(process.env)
+    .filter(([name]) => /KEY|TOKEN|SECRET|PASSWORD|AUTHORIZATION/i.test(name))
+    .map(([, value]) => value || '')].filter(value => value.length >= 4);
+  for (const secret of secrets) message = message.split(secret).join('[REDACTED]');
+  return message
+    .replace(/AIza[\w-]+/g, '[REDACTED]')
+    .replace(/eyJ[\w-]+\.[\w-]+\.[\w-]+/g, '[REDACTED]')
+    .replace(/((?:authorization|x-goog-api-key|api[_-]?key|access_token)["']?\s*[:=]\s*)[^\r\n,}]+/gi, '$1[REDACTED]')
+    .replace(/Bearer\s+[^\s"',}]+/gi, 'Bearer [REDACTED]')
+    .replace(/([?&]key=)[^&\s"']+/gi, '$1[REDACTED]')
+    .slice(0, 1500);
+}
+
+function errorStatus(error: unknown): number | undefined {
+  const err = error as { status?: unknown; code?: unknown } | null;
+  const status = Number(err?.status ?? err?.code);
+  return Number.isInteger(status) && status >= 100 && status <= 599 ? status : undefined;
+}
+
+function isCredentialOrTrustError(error: unknown): boolean {
+  const status = errorStatus(error);
+  const err = error as { code?: string; cause?: { code?: string } } | null;
+  return status === 401 || status === 403 ||
+    /CERT|SELF_SIGNED|UNABLE_TO_VERIFY/.test(err?.cause?.code ?? err?.code ?? '');
+}
+
+async function discoverModels(client: GoogleGenAI, apiKey: string): Promise<string[]> {
+  // Share in-flight discovery across requests without retaining the raw credential.
+  const cacheKey = createHash('sha256').update(apiKey).digest('hex');
+  const cached = modelDiscoveryCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.models;
+  if (modelDiscoveryCache.size >= 32) modelDiscoveryCache.delete(modelDiscoveryCache.keys().next().value!);
+  const entry = { expiresAt: Date.now() + 5 * 60_000, models: Promise.resolve<string[]>([]) };
+  entry.models = (async () => {
+    try {
+      const pager = await client.models.list({ config: {
+        pageSize: 100, httpOptions: { timeout: 30_000, retryOptions: { attempts: 1 } }
+      } });
+      const names: string[] = [];
+      for await (const model of pager) {
+        if (model.name && /flash/i.test(model.name) &&
+          !/image|tts|audio|live|native|robotics/i.test(model.name) &&
+          model.supportedActions?.includes('generateContent')) names.push(model.name);
+      }
+      if (!names.length) throw new Error('Model discovery returned no compatible Flash text models');
+      const rank = (name: string) => {
+        const index = CANDIDATE_MODELS.findIndex(candidate => candidate.replace(/^models\//, '') === name.replace(/^models\//, ''));
+        return index < 0 ? CANDIDATE_MODELS.length : index;
+      };
+      return [...new Set(names)].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+    } catch (error) {
+      // Cache discovery failures briefly to avoid repeated list calls during an outage.
+      entry.expiresAt = Date.now() + 30_000;
+      console.warn('Gemini discovery failed (HTTP ' + (errorStatus(error) ?? 'none') + '): ' + sanitizedError(error, apiKey));
+      if (isCredentialOrTrustError(error)) throw new Error('Gemini connection/configuration failed: ' + sanitizedError(error, apiKey));
+      console.warn('Using unverified Gemini model candidates after discovery failure.');
+      return [...CANDIDATE_MODELS];
+    }
+  })();
+  modelDiscoveryCache.set(cacheKey, entry);
+  return entry.models;
+}
 
 async function callGeminiWithModelFallback(
   client: GoogleGenAI,
-  baseParams: any
-): Promise<any> {
-  let lastError: any = null;
-
-  for (const model of CANDIDATE_MODELS) {
+  baseParams: Omit<GenerateContentParameters, 'model'>,
+  apiKey = '',
+  validate?: (text: string) => void
+): Promise<{ response: GenerateContentResponse; model: string }> {
+  const models = (await discoverModels(client, apiKey)).slice(0, MAX_MODEL_ATTEMPTS);
+  const failures: string[] = [];
+  for (const model of models) {
     try {
-      return await client.models.generateContent({
-        ...baseParams,
-        model
+      const response = await client.models.generateContent({
+        ...baseParams, model,
+        config: { ...baseParams.config, httpOptions: { timeout: 60_000, retryOptions: { attempts: 1 } } }
       });
-    } catch (err: any) {
-      lastError = err;
-      const isQuota =
-        err?.status === 429 ||
-        err?.message?.includes('429') ||
-        err?.message?.includes('RESOURCE_EXHAUSTED');
-
-      console.warn(
-        `Gemini model ${model} failed${isQuota ? ' (quota exceeded/429)' : ''}. Attempting alternate model...`
-      );
-
-      if (!isQuota) {
-        // If it's a syntax or validation error, retrying other models won't help
-        break;
-      }
+      const text = response.text;
+      if (!text?.trim()) throw new Error('Gemini returned no text content');
+      validate?.(text);
+      console.info('Gemini generation succeeded: ' + model);
+      return { response, model };
+    } catch (error) {
+      const failure = model + ' (HTTP ' + (errorStatus(error) ?? 'none') + '): ' + sanitizedError(error, apiKey);
+      console.warn('Gemini attempt failed: ' + failure);
+      failures.push(failure);
+      // Authentication and certificate failures affect every model. Other HTTP,
+      // transient network, and invalid structured responses try the next candidate.
+      if (isCredentialOrTrustError(error)) break;
     }
   }
-  throw lastError;
+  throw new Error('Gemini generation failed; no synthetic content returned. ' + failures.join('; '));
 }
 
-function generateHashtagsForContent(text: string): string {
-  const lower = text.toLowerCase();
-  const tags = new Set<string>();
-
-  if (
-    lower.includes('self') ||
-    lower.includes('body') ||
-    lower.includes('mind') ||
-    lower.includes('consciousness') ||
-    lower.includes('human')
-  ) {
-    tags.add('#SelfAwareness');
-    tags.add('#MindAndBody');
-    tags.add('#Consciousness');
-    tags.add('#HumanValues');
-    tags.add('#InnerGrowth');
-  }
-  if (
-    lower.includes('ai') ||
-    lower.includes('intelligence') ||
-    lower.includes('algorithm') ||
-    lower.includes('tech')
-  ) {
-    tags.add('#ArtificialIntelligence');
-    tags.add('#TechInnovation');
-    tags.add('#FutureTech');
-  }
-  if (
-    lower.includes('educat') ||
-    lower.includes('student') ||
-    lower.includes('learning') ||
-    lower.includes('school')
-  ) {
-    tags.add('#EdTech');
-    tags.add('#LifelongLearning');
-    tags.add('#Education');
-  }
-  if (
-    lower.includes('health') ||
-    lower.includes('medical') ||
-    lower.includes('care') ||
-    lower.includes('wellness')
-  ) {
-    tags.add('#Wellness');
-    tags.add('#HealthAndMind');
-    tags.add('#HolisticHealth');
-  }
-  if (
-    lower.includes('business') ||
-    lower.includes('market') ||
-    lower.includes('manage') ||
-    lower.includes('leader')
-  ) {
-    tags.add('#Leadership');
-    tags.add('#Strategy');
-    tags.add('#BusinessInsights');
-  }
-
-  tags.add('#GroundedInsights');
-  tags.add('#KnowledgeSharing');
-  tags.add('#DeepDive');
-
-  return Array.from(tags).slice(0, 6).join(' ');
-}
-
-function fallbackExtractSot(rawText: string, spans: SourceSpan[]): SourceOfTruth {
-  // 1. Strict filtering of PDF and document artifacts
-  const validSpans = spans.filter(s => {
-    const t = s.text.trim();
-    if (t.length < 25) return false;
-    // Strip page markers and chapter headings
-    if (/^(?:page\s+)?\d+\s*(?:of|\/)\s*\d+/i.test(t)) return false;
-    if (/^page\s+\d+$/i.test(t)) return false;
-    if (/^\d+$/i.test(t)) return false;
-    if (/^chapter\s+[0-9ivxlcdm\w]+/i.test(t)) return false;
-    if (/^(?:table\s+of\s+contents|all\s+rights\s+reserved|references|index)$/i.test(t)) return false;
-    // Strip incomplete sentence fragments that end in trailing prepositions/conjunctions
-    if (/\b(?:and|or|from|with|to|in|of|the|a|for)\s*$/i.test(t)) return false;
-    return true;
-  });
-
-  const cleanCandidates = validSpans.length > 0 ? validSpans : spans;
-
-  // 2. Identify defining, high-signal sentences for the summary
-  const keyConceptSentences = cleanCandidates.filter(s =>
-    /\b(?:is|are|defined|means|co-existence|essence|consists|requires|indicates|found|results|shows|explore|understanding|relation|interaction)\b/i.test(
-      s.text
-    )
-  );
-
-  const summary = (
-    keyConceptSentences.slice(0, 2).map(s => s.text).join(' ') ||
-    cleanCandidates.slice(0, 2).map(s => s.text).join(' ') ||
-    rawText.substring(0, 250)
-  ).trim();
-
-  // 3. Extract 4-5 articulate core facts (clean complete sentences)
-  const coreFacts = cleanCandidates.slice(0, Math.min(5, cleanCandidates.length)).map((s, idx) => ({
-    factId: `F${idx + 1}`,
-    statement: s.text.trim().replace(/[\.\s]+$/, '') + '.',
-    sourceSpans: [s.id]
-  }));
-
-  // 4. Extract ONLY genuine quantitative metrics with units (never bare page numbers or chapter numbers!)
-  const realMetricRegex = /\b(\d+(?:\.\d+)?\s*(?:%|\$|k|M|B|x|hours?|days?|years?|kg|km|users?|people|institutions?|percent))\b/i;
-  const criticalMetrics: { label: string; value: string; sourceSpan: string }[] = [];
-
-  cleanCandidates.forEach(s => {
-    // Never extract from lines referencing page or chapter
-    if (/\b(page|chapter|section|slide)\b/i.test(s.text)) return;
-
-    const match = s.text.match(realMetricRegex);
-    if (match && criticalMetrics.length < 4) {
-      const labelSnippet = s.text
-        .replace(realMetricRegex, '')
-        .replace(/[^\w\s]/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-
-      const cleanLabel =
-        labelSnippet.length > 5 ? labelSnippet.substring(0, 32).trim() : 'Measured Metric';
-
-      criticalMetrics.push({
-        label: cleanLabel,
-        value: match[0],
-        sourceSpan: s.id
-      });
-    }
-  });
-
-  return {
-    summary,
-    coreFacts:
-      coreFacts.length > 0
-        ? coreFacts
-        : [{ factId: 'F1', statement: rawText.substring(0, 150), sourceSpans: ['S1'] }],
-    entities: [],
-    criticalMetrics
+type JsonSchema = {
+  type: 'object' | 'array' | 'string' | 'number' | 'boolean';
+  properties?: Record<string, JsonSchema>;
+  required?: string[];
+  items?: JsonSchema;
+  enum?: string[];
+  minItems?: number;
+};
+const stringSchema: JsonSchema = { type: 'string' };
+const stringsSchema: JsonSchema = { type: 'array', items: stringSchema, minItems: 1 };
+const objectSchema = (properties: Record<string, JsonSchema>, required = Object.keys(properties)): JsonSchema =>
+  ({ type: 'object', properties, required });
+const sourceOfTruthSchema = objectSchema({
+  summary: stringSchema,
+  coreFacts: { type: 'array', minItems: 1, items: objectSchema({
+    factId: stringSchema, statement: stringSchema, sourceSpans: stringsSchema
+  }) },
+  entities: { type: 'array', items: objectSchema({ name: stringSchema, type: stringSchema }) },
+  criticalMetrics: { type: 'array', items: objectSchema({ label: stringSchema, value: stringSchema, sourceSpan: stringSchema }) }
+} satisfies Record<keyof SourceOfTruth, JsonSchema>);
+const outputTypes: OutputType[] = ['instagram', 'youtube', 'linkedin', 'blog', 'whatsapp', 'twitter'];
+const outputTypeSchema: JsonSchema = { type: 'string', enum: outputTypes };
+// id/status and derived media fields are supplied locally, as before.
+type GeneratedOutput = Pick<OutputItem, 'outputType' | 'title' | 'subtitle' | 'content' | 'claims'> &
+  Pick<OutputItem, 'imageUrl' | 'storyboard' | 'hashtags'> & {
+    qualityScore?: number | null;
+    characterCount?: number;
+    groundedPercent?: number | null;
   };
+const generatedOutputSchema = objectSchema({
+  outputType: outputTypeSchema, title: stringSchema, subtitle: stringSchema, content: stringSchema,
+  qualityScore: { type: 'number' }, characterCount: { type: 'number' }, groundedPercent: { type: 'number' },
+  claims: { type: 'array', minItems: 1, items: objectSchema({
+    id: stringSchema, outputType: outputTypeSchema, claimText: stringSchema,
+    sourceSpanIds: stringsSchema, grounded: { type: 'boolean' }, contradictionFlag: { type: 'boolean' },
+    contradictionDetails: stringSchema
+  }, ['id', 'outputType', 'claimText', 'sourceSpanIds', 'grounded', 'contradictionFlag']) },
+  imageUrl: stringSchema,
+  hashtags: { type: 'array', items: stringSchema },
+  storyboard: { type: 'array', items: objectSchema({
+    timestamp: stringSchema, title: stringSchema, visualDescription: stringSchema, narration: stringSchema
+  }) }
+} satisfies Record<keyof GeneratedOutput, JsonSchema>,
+['outputType', 'title', 'subtitle', 'content', 'claims']);
+const generatedOutputsSchema = objectSchema({ outputs: { type: 'array', minItems: 1, items: generatedOutputSchema } });
+
+const verifiedClaimItemSchema = objectSchema({
+  id: stringSchema,
+  status: { type: 'string', enum: ['supported', 'partial', 'unsupported'] },
+  explanation: stringSchema,
+  suggestedCorrection: stringSchema,
+  sourceAmbiguity: { type: 'boolean' }
+}, ['id', 'status', 'explanation']);
+const verifiedClaimsSchema = objectSchema({
+  verifiedClaims: { type: 'array', items: verifiedClaimItemSchema }
+});
+
+const contradictionSchema = objectSchema({
+  topic: stringSchema,
+  severity: { type: 'string', enum: ['high', 'medium', 'low'] },
+  description: stringSchema,
+  outputAType: outputTypeSchema,
+  outputAText: stringSchema,
+  outputBType: outputTypeSchema,
+  outputBText: stringSchema,
+  suggestedFix: stringSchema
+});
+const crossConsistencySchema = objectSchema({
+  contradictions: { type: 'array', items: contradictionSchema }
+});
+
+function validateSchema(value: unknown, schema: JsonSchema, path = 'response'): void {
+  if (schema.type === 'object') {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(path + ' must be an object');
+    const object = value as Record<string, unknown>;
+    for (const name of schema.required || []) {
+      if (!(name in object)) throw new Error(path + '.' + name + ' is required');
+    }
+    for (const [name, property] of Object.entries(schema.properties || {})) {
+      if (name in object) validateSchema(object[name], property, path + '.' + name);
+    }
+  } else if (schema.type === 'array') {
+    if (!Array.isArray(value) || value.length < (schema.minItems || 0)) throw new Error(path + ' must be an array with at least ' + (schema.minItems || 0) + ' items');
+    value.forEach((item, index) => validateSchema(item, schema.items!, path + '[' + index + ']'));
+  } else if (typeof value !== schema.type || (schema.type === 'number' && !Number.isFinite(value))) {
+    throw new Error(path + ' must be a ' + schema.type);
+  } else if (schema.enum && !schema.enum.includes(value as string)) {
+    throw new Error(path + ' is not an allowed value');
+  }
+}
+
+function parseStructuredJson<T>(text: string, schema: JsonSchema): T {
+  const trimmed = text.replace(/^\uFEFF/, '').trim().replace(/^\x60\x60\x60(?:json)?\s*([\s\S]*?)\s*\x60\x60\x60$/i, '$1').trim();
+  let parsed: unknown;
+  try { parsed = JSON.parse(trimmed); }
+  catch (error) { throw new Error('Gemini JSON parsing failed: ' + sanitizedError(error)); }
+  validateSchema(parsed, schema);
+  return parsed as T;
+}
+
+function validateReferences(ids: string[], validIds: Set<string>, path: string): void {
+  if (!ids.length || ids.some(id => !validIds.has(id))) throw new Error(path + ' has missing or unknown source-span references');
+}
+
+function parseSourceOfTruth(text: string, spans: SourceSpan[]): SourceOfTruth {
+  const sot = parseStructuredJson<SourceOfTruth>(text, sourceOfTruthSchema);
+  if (!sot.summary.trim() || sot.coreFacts.some(fact => !fact.factId.trim() || !fact.statement.trim())) throw new Error('Gemini Source of Truth has empty required text');
+  if (new Set(sot.coreFacts.map(fact => fact.factId)).size !== sot.coreFacts.length) throw new Error('Gemini returned duplicate fact IDs');
+  const validIds = new Set(spans.map(span => span.id));
+  sot.coreFacts.forEach(fact => validateReferences(fact.sourceSpans, validIds, 'coreFacts.sourceSpans'));
+  sot.criticalMetrics.forEach(metric => validateReferences([metric.sourceSpan], validIds, 'criticalMetrics.sourceSpan'));
+  return sot;
+}
+
+function parseOutputs(text: string, spans: SourceSpan[], selectedTypes: OutputType[]): { outputs: GeneratedOutput[] } {
+  const parsed = parseStructuredJson<{ outputs: GeneratedOutput[] }>(text, generatedOutputsSchema);
+  const expected = new Set(selectedTypes);
+  if (parsed.outputs.length !== expected.size || new Set(parsed.outputs.map(output => output.outputType)).size !== expected.size ||
+    parsed.outputs.some(output => !expected.has(output.outputType))) throw new Error('Gemini must return exactly one output for each requested format');
+  const validIds = new Set(spans.map(span => span.id));
+  for (const output of parsed.outputs) {
+    if (!output.title.trim() || !output.content.trim()) throw new Error('Gemini output has empty required text');
+    if (output.qualityScore != null && (output.qualityScore < 0 || output.qualityScore > 100)) throw new Error('Gemini output qualityScore must be between 0 and 100');
+    if (output.groundedPercent != null && (output.groundedPercent < 0 || output.groundedPercent > 100)) throw new Error('Gemini output groundedPercent must be between 0 and 100');
+    for (const claim of output.claims) {
+      if (!claim.id.trim() || !claim.claimText.trim() || claim.outputType !== output.outputType) throw new Error('Gemini claim is incomplete or belongs to another format');
+      validateReferences(claim.sourceSpanIds, validIds, 'claims.sourceSpanIds');
+    }
+  }
+  return parsed;
 }
 
 function getThematicImageUrl(text: string): string {
@@ -220,170 +280,6 @@ function getThematicImageUrl(text: string): string {
   return 'https://images.unsplash.com/photo-1451187580459-43490279c0fa?auto=format&fit=crop&w=1200&q=80';
 }
 
-function fallbackGenerateOutputs(
-  sot: SourceOfTruth,
-  spans: SourceSpan[],
-  config: QuestionnairePreferences,
-  selectedTypes: OutputType[]
-): OutputItem[] {
-  const imageUrl = getThematicImageUrl(sot.summary + ' ' + (sot.coreFacts[0]?.statement || ''));
-  const isAudioPreferred = config.outputCategory === 'Audio';
-  const isVideoPreferred = config.outputCategory === 'Video';
-
-  const rawStoryboard = [
-    {
-      title: 'Scene 1: Core Concept & Strategic Overview',
-      visualDescription: 'Kinetic title card introducing primary context and canonical source thesis.',
-      narration: sot.summary
-    },
-    {
-      title: 'Scene 2: Grounded Facts & Core Principles',
-      visualDescription: 'B-roll sequence with dynamic callouts emphasizing verified primary facts.',
-      narration: sot.coreFacts.map(f => f.statement).join(' ') || sot.summary
-    },
-    {
-      title: 'Scene 3: Deep Insights & Evidence',
-      visualDescription: 'Split-screen data visualization highlighting verified aspects and relationships.',
-      narration:
-        sot.criticalMetrics.map(m => `Key metric: ${m.value} for ${m.label}`).join('. ') ||
-        'All findings grounded directly in verified source records.'
-    },
-    {
-      title: 'Scene 4: Executive Takeaway & Wrap-up',
-      visualDescription: 'Closing hero frame with InfoMorph grounding verification seal and call to action.',
-      narration: 'Explore the full grounded breakdown verified from canonical source records.'
-    }
-  ];
-
-  const storyboard = calculateStoryboardTimestamps(rawStoryboard);
-  const totalVideoDuration = storyboard[storyboard.length - 1]?.timestamp.split(' - ')[1] || '1:15';
-
-  return selectedTypes.map(type => {
-    const id = `out-${type}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
-    const claims = sot.coreFacts.map((fact, i) => ({
-      id: `c-${type}-${i + 1}`,
-      outputType: type,
-      claimText: fact.statement,
-      sourceSpanIds: fact.sourceSpans,
-      grounded: true,
-      contradictionFlag: false
-    }));
-
-    let title = 'Document Transformation';
-    let subtitle = `Tailored for ${config.audience} • Tone: ${config.tone}`;
-    let content = '';
-
-    const hashtags = generateHashtagsForContent(
-      sot.summary + ' ' + sot.coreFacts.map(f => f.statement).join(' ')
-    );
-
-    switch (type) {
-      case 'instagram': {
-        title = 'Instagram Post';
-        subtitle = 'Ready-to-publish Instagram caption & takeaways';
-
-        const cleanSummary = sot.summary.replace(/^(chapter|page)\s+[^\.]*\.\s*/i, '');
-        const hook = cleanSummary.split('.')[0]?.trim() || 'Core Discovery & Analysis';
-
-        const bulletPoints = sot.coreFacts
-          .slice(0, 4)
-          .map(f => `✨ ${f.statement.replace(/[\.\s]+$/, '')}.`)
-          .join('\n\n');
-
-        const metricsSection =
-          sot.criticalMetrics.length > 0
-            ? `\n\n📊 Key Numbers & Measured Data:\n` +
-              sot.criticalMetrics.map(m => `• ${m.label}: ${m.value}`).join('\n')
-            : '';
-
-        content = `🧠 ${hook}\n\n${cleanSummary}\n\n💡 Core Key Takeaways:\n${bulletPoints}${metricsSection}\n\n💬 What resonates most with you about this? Drop your perspective in the comments below!\n\n📌 Save this post for your daily reflection and share it with someone who values deep insights.\n\n${hashtags}`;
-        break;
-      }
-
-      case 'linkedin':
-        title = 'Professional Analysis';
-        content = `📌 Executive Summary:\n${sot.summary}\n\n🔍 Core Insights & Principles:\n${sot.coreFacts.map(f => `• ${f.statement}`).join('\n')}\n\n${
-          sot.criticalMetrics.length > 0
-            ? `📊 Key Data Points:\n${sot.criticalMetrics.map(m => `• ${m.label}: ${m.value}`).join('\n')}\n\n`
-            : ''
-        }What are your thoughts on this perspective? Let's connect in the comments.\n\n#Leadership #Insights #ContinuousLearning`;
-        break;
-
-      case 'twitter':
-        title = 'Insight Thread';
-        content = `🧵 1/4: ${sot.summary.substring(0, 220)}\n\n2/4: Key Takeaways:\n${sot.coreFacts.slice(0, 2).map(f => `• ${f.statement}`).join('\n')}\n\n3/4: ${
-          sot.criticalMetrics.length > 0
-            ? `Key figures:\n${sot.criticalMetrics.slice(0, 2).map(m => `• ${m.value} - ${m.label}`).join('\n')}`
-            : 'Grounding verified against primary source materials without factual drift.'
-        }\n\n4/4: Read the full briefing above. Grounded and canonical context.`;
-        break;
-
-      case 'blog':
-        title = 'In-Depth Analysis & Article';
-        content = `# Overview & Synthesis\n\n${sot.summary}\n\n## Verified Key Findings\n\n${sot.coreFacts.map(f => `### ${f.statement}\n*Grounded reference:* Verified source context.`).join('\n\n')}\n\n${
-          sot.criticalMetrics.length > 0
-            ? `## Data & Metrics\n\n${sot.criticalMetrics.map(m => `- **${m.value}**: ${m.label}`).join('\n')}\n\n`
-            : ''
-        }## Conclusion\n\nThis synthesis reflects verified source data preserved across channels without factual drift.`;
-        break;
-
-      case 'whatsapp':
-        title = 'Briefing Note';
-        content = `*IMPORTANT BRIEFING*\n\n*Summary:* ${sot.summary}\n\n*Key Insights:*\n${sot.coreFacts.map(f => `✅ ${f.statement}`).join('\n')}\n\n${
-          sot.criticalMetrics.length > 0
-            ? `*Key Metrics:*\n${sot.criticalMetrics.map(m => `📊 ${m.value} — ${m.label}`).join('\n')}\n\n`
-            : ''
-        }_Shared via InfoMorph Grounded Pipeline_`;
-        break;
-
-      case 'youtube': {
-        const introNarration = `Today we are breaking down: ${sot.summary.substring(0, 140)}`;
-        const factsNarration = sot.coreFacts.map((f, i) => `Point ${i + 1}: ${f.statement}`).join('. ');
-        const metricsNarration =
-          sot.criticalMetrics.map(m => `Examining ${m.value} in relation to ${m.label}`).join('. ') ||
-          'Examining verified indicators.';
-
-        const introDuration = estimateSpokenDurationSeconds(introNarration, 135);
-        const factsDuration = estimateSpokenDurationSeconds(factsNarration, 135);
-        const metricsDuration = estimateSpokenDurationSeconds(metricsNarration, 135);
-
-        const t0 = '0:00';
-        const t1 = formatSecondsToTime(introDuration);
-        const t2 = formatSecondsToTime(introDuration + factsDuration);
-        const t3 = formatSecondsToTime(introDuration + factsDuration + metricsDuration);
-
-        title = 'Video Outline & Script';
-        content = `Title: ${sot.summary.substring(0, 70)}\n\nDescription:\n${sot.summary}\n\nTimestamps:\n${t0} - Overview & Strategic Context\n${t1} - Core Facts & Grounded Evidence\n${t2} - Verified Metrics & Key Principles\n${t3} - Strategic Takeaways & Wrap-up\n\nTags: ${hashtags}`;
-        break;
-      }
-    }
-
-    const determinedMediaType: 'post' | 'audio' | 'video' = isAudioPreferred
-      ? 'audio'
-      : isVideoPreferred || type === 'youtube'
-      ? 'video'
-      : 'post';
-
-    return {
-      id,
-      outputType: type,
-      title,
-      subtitle,
-      content,
-      qualityScore: 98,
-      characterCount: content.length,
-      groundedPercent: 100,
-      status: 'ready' as const,
-      claims,
-      imageUrl,
-      mediaType: determinedMediaType,
-      audioDuration: calculateAudioDuration(content, 140),
-      videoDuration: totalVideoDuration,
-      storyboard
-    };
-  });
-}
-
 export class GeminiPipelineService {
   private client: GoogleGenAI | null = null;
   private apiKey: string | null = null;
@@ -394,7 +290,7 @@ export class GeminiPipelineService {
       try {
         this.client = new GoogleGenAI({ apiKey: this.apiKey });
       } catch (e) {
-        console.warn('Failed to initialize GoogleGenAI client:', e);
+        throw new Error('Failed to initialize Gemini: ' + sanitizedError(e, this.apiKey));
       }
     }
   }
@@ -408,7 +304,7 @@ export class GeminiPipelineService {
    */
   async extractSourceOfTruth(rawText: string, spans: SourceSpan[]): Promise<SourceOfTruth> {
     if (!this.client) {
-      return fallbackExtractSot(rawText, spans);
+      throw new Error('Gemini API key is not configured; no synthetic content returned.');
     }
 
     try {
@@ -437,19 +333,20 @@ Return ONLY valid JSON:
 Source Document:
 ${indexedContent}`;
 
-      const response = await callGeminiWithModelFallback(this.client, {
+      const { response } = await callGeminiWithModelFallback(this.client, {
         contents: prompt,
         config: {
           responseMimeType: 'application/json',
+          responseJsonSchema: sourceOfTruthSchema,
           temperature: 0.1
         }
-      });
+      }, this.apiKey || '', text => { parseSourceOfTruth(text, spans); });
 
-      const text = response.text || '';
-      return JSON.parse(text) as SourceOfTruth;
+      return parseSourceOfTruth(response.text || '', spans);
     } catch (err) {
-      console.error('Gemini extractSourceOfTruth error, falling back to document synthesis:', err);
-      return fallbackExtractSot(rawText, spans);
+      const message = sanitizedError(err, this.apiKey || '');
+      console.error('Gemini Source of Truth extraction failed: ' + message);
+      throw new Error(message);
     }
   }
 
@@ -463,7 +360,7 @@ ${indexedContent}`;
     selectedTypes: OutputType[]
   ): Promise<OutputItem[]> {
     if (!this.client) {
-      return fallbackGenerateOutputs(sot, spans, config, selectedTypes);
+      throw new Error('Gemini API key is not configured; no synthetic content returned.');
     }
 
     try {
@@ -480,6 +377,9 @@ Configuration:
 
 Requested Formats: ${selectedTypes.join(', ')}
 Source of Truth: ${JSON.stringify(sot)}
+Source spans: ${JSON.stringify(spans)}
+
+Return exactly one output for each requested format. Every factual claim must reference the provided source span IDs. Never invent span IDs. Claims must use the same outputType as their containing output.
 
 Format Rules:
 - For "instagram": Format strictly as a high-engagement, ready-to-publish "Instagram Post". Begin with an attention-grabbing hook, provide 3-4 bulleted deep takeaways (complete, articulate sentences), and close with an engaging question and relevant hashtags. NEVER format as a carousel, NEVER mention "Carousel" or "Slide", and NEVER include page numbers or document headers.
@@ -493,27 +393,22 @@ Return JSON:
       "title": "string",
       "subtitle": "string",
       "content": "string",
-      "qualityScore": 98,
       "characterCount": 400,
-      "groundedPercent": 98,
       "claims": [{"id": "c1", "outputType": "linkedin", "claimText": "string", "sourceSpanIds": ["S1"], "grounded": true, "contradictionFlag": false}]
     }
   ]
 }`;
 
-      const response = await callGeminiWithModelFallback(this.client, {
+      const { response, model: modelUsed } = await callGeminiWithModelFallback(this.client, {
         contents: prompt,
         config: {
           responseMimeType: 'application/json',
+          responseJsonSchema: generatedOutputsSchema,
           temperature: 0.2
         }
-      });
+      }, this.apiKey || '', text => { parseOutputs(text, spans, selectedTypes); });
 
-      const text = response.text || '';
-      const parsed = JSON.parse(text);
-      if (!parsed.outputs || parsed.outputs.length === 0) {
-        throw new Error('Empty outputs array from Gemini');
-      }
+      const parsed = parseOutputs(response.text || '', spans, selectedTypes);
 
       const defaultImg = getThematicImageUrl(sot.summary + ' ' + (sot.coreFacts[0]?.statement || ''));
       const isAudio = config.outputCategory === 'Audio';
@@ -546,7 +441,7 @@ Return JSON:
 
       const defaultStoryboard = calculateStoryboardTimestamps(defaultStoryboardRaw);
 
-      return (parsed.outputs || []).map((o: any) => {
+      return parsed.outputs.map(o => {
         let finalTitle = o.title;
         let finalContent = o.content || '';
         if (o.outputType === 'instagram') {
@@ -570,6 +465,11 @@ Return JSON:
           id: `out-${o.outputType}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
           title: finalTitle,
           content: finalContent,
+          characterCount: finalContent.length,
+          qualityScore: null,
+          groundedPercent: null,
+          isFallback: false,
+          modelUsed,
           status: 'ready' as const,
           imageUrl: o.imageUrl || defaultImg,
           mediaType: isAudio ? 'audio' : isVideo || o.outputType === 'youtube' ? 'video' : 'post',
@@ -579,26 +479,375 @@ Return JSON:
         };
       });
     } catch (err) {
-      console.error('Gemini generate error, falling back to document synthesis:', err);
-      return fallbackGenerateOutputs(sot, spans, config, selectedTypes);
+      const message = sanitizedError(err, this.apiKey || '');
+      console.error('Gemini coordinated generation failed: ' + message);
+      throw new Error(message);
     }
   }
 
   /**
    * Stage 3: Verification
+   * C1: Individual claim verification against cited source spans.
+   * Runs in batches (one call per output).
+   */
+  async verifyOutputClaims(
+    output: OutputItem,
+    spans: SourceSpan[]
+  ): Promise<ClaimItem[]> {
+    if (!output.claims || output.claims.length === 0) {
+      return [];
+    }
+
+    const spanMap = new Map<string, string>();
+    for (const span of spans) {
+      spanMap.set(span.id, span.text);
+    }
+
+    // Separate claims with valid cited evidence vs missing evidence
+    const claimsNeedingVerification: Array<{ claim: ClaimItem; evidence: string }> = [];
+    const instantResults: Map<string, Partial<ClaimItem>> = new Map();
+
+    for (const claim of output.claims) {
+      const citedTexts = (claim.sourceSpanIds || [])
+        .map(id => spanMap.get(id))
+        .filter((t): t is string => Boolean(t && t.trim()));
+
+      if (citedTexts.length === 0) {
+        // Zero relevant evidence -> unsupported
+        instantResults.set(claim.id, {
+          status: 'unsupported',
+          grounded: false,
+          explanation: 'No relevant source evidence was cited for this claim.',
+          suggestedCorrection: 'Attach valid source citations or remove unsubstantiated statement.',
+          sourceAmbiguity: false
+        });
+      } else {
+        const evidenceStr = (claim.sourceSpanIds || [])
+          .map(id => `[${id}]: "${spanMap.get(id) || ''}"`)
+          .join('\n');
+        claimsNeedingVerification.push({ claim, evidence: evidenceStr });
+      }
+    }
+
+    if (claimsNeedingVerification.length === 0) {
+      return output.claims.map(c => {
+        const r = instantResults.get(c.id);
+        return {
+          ...c,
+          status: r?.status || 'unsupported',
+          grounded: r?.grounded ?? false,
+          explanation: r?.explanation || '',
+          suggestedCorrection: r?.suggestedCorrection,
+          sourceAmbiguity: r?.sourceAmbiguity ?? false
+        };
+      });
+    }
+
+    if (!this.client) {
+      throw new Error('Gemini API key is not configured; cannot perform real verification.');
+    }
+
+    const claimsPromptList = claimsNeedingVerification.map(({ claim, evidence }, idx) => {
+      return `--- CLAIM ${idx + 1} ---
+Claim ID: ${claim.id}
+Claim Text: "${claim.claimText}"
+Cited Source Evidence:
+${evidence}`;
+    }).join('\n\n');
+
+    const prompt = `You are the InfoMorph Grounding Verification Engine.
+Your task is to strictly verify whether each generated claim is factually grounded in its cited source evidence.
+
+VERIFICATION RULES:
+1. Evaluate FACTUAL MEANING, not just surface keyword matching.
+2. NUMERICAL & QUANTITATIVE ACCURACY: If the claim asserts "500 students" but cited source says "5,000 students", it is UNSUPPORTED. Amounts, percentages, and metrics must match exactly.
+3. DATES & DEADLINES: Verify exact day, month, and year. "Closes Friday" must align with the specific deadline cited.
+4. ELIGIBILITY & CONDITIONS: Criteria must not be broadened, weakened, or removed.
+5. SOURCE AMBIGUITY: If the source itself presents conflicting or ambiguous figures, set "sourceAmbiguity": true, "status": "partial" or "unsupported", and explain.
+6. STATUS CRITERIA:
+   - "supported": Fully substantiated by cited source evidence.
+   - "partial": Partially substantiated, minor nuance lost, or slight overgeneralization.
+   - "unsupported": Contradicts source, not supported by evidence, or asserts facts absent from cited text.
+7. For any "partial" or "unsupported" claim, provide a clear, factual explanation and a concrete suggestedCorrection.
+
+CLAIMS TO VERIFY:
+${claimsPromptList}
+
+Return ONLY valid JSON matching this schema:
+{
+  "verifiedClaims": [
+    {
+      "id": "string (matching Claim ID)",
+      "status": "supported" | "partial" | "unsupported",
+      "explanation": "string concise factual justification",
+      "suggestedCorrection": "string concrete correction if needed, or empty string",
+      "sourceAmbiguity": boolean
+    }
+  ]
+}`;
+
+    const { response } = await callGeminiWithModelFallback(
+      this.client,
+      {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        config: {
+          responseMimeType: 'application/json',
+          temperature: 0.1
+        }
+      },
+      this.apiKey || '',
+      text => {
+        parseStructuredJson(text, verifiedClaimsSchema);
+      }
+    );
+
+    const parsed = parseStructuredJson<{
+      verifiedClaims: Array<{
+        id: string;
+        status: 'supported' | 'partial' | 'unsupported';
+        explanation: string;
+        suggestedCorrection?: string;
+        sourceAmbiguity?: boolean;
+      }>;
+    }>(response.text || '', verifiedClaimsSchema);
+
+    const verifiedMap = new Map(parsed.verifiedClaims.map(v => [v.id, v]));
+
+    return output.claims.map(c => {
+      const instant = instantResults.get(c.id);
+      if (instant) {
+        return {
+          ...c,
+          status: instant.status || 'unsupported',
+          grounded: instant.grounded ?? false,
+          explanation: instant.explanation || '',
+          suggestedCorrection: instant.suggestedCorrection,
+          sourceAmbiguity: instant.sourceAmbiguity ?? false
+        };
+      }
+
+      const verified = verifiedMap.get(c.id);
+      if (!verified) {
+        return {
+          ...c,
+          status: 'unsupported' as const,
+          grounded: false,
+          explanation: 'Claim verification could not be confirmed by model.',
+          sourceAmbiguity: false
+        };
+      }
+
+      return {
+        ...c,
+        status: verified.status,
+        grounded: verified.status === 'supported',
+        explanation: verified.explanation,
+        suggestedCorrection: verified.suggestedCorrection || undefined,
+        sourceAmbiguity: Boolean(verified.sourceAmbiguity)
+      };
+    });
+  }
+
+  /**
+   * C2: Cross-output consistency verification across all generated outputs.
+   */
+  async verifyCrossOutputConsistency(outputs: OutputItem[]): Promise<ContradictionItem[]> {
+    if (!outputs || outputs.length < 2) {
+      return [];
+    }
+
+    if (!this.client) {
+      throw new Error('Gemini API key is not configured; cannot perform cross-output consistency check.');
+    }
+
+    const summaries = outputs.map(o => {
+      const claimsStr = (o.claims || []).map(c => `  - [${c.id}] ${c.claimText}`).join('\n');
+      return `Channel: ${o.outputType.toUpperCase()} (Title: "${o.title}")\nContent: "${o.content.substring(0, 500)}..."\nClaims:\n${claimsStr}`;
+    }).join('\n\n');
+
+    const prompt = `You are the InfoMorph Cross-Output Consistency Engine.
+Compare factual statements across these generated channel outputs for the same primary source.
+
+INCONSISTENCY DETECTION RULES:
+1. Detect genuine factual inconsistencies between channels regarding:
+   - Dates & deadlines
+   - Numbers, metrics, and percentages
+   - Monetary amounts and budgets
+   - Eligibility conditions and requirements
+   - Locations and event details
+2. IMPORTANT: Differences in tone, brevity, hashtags, formatting, or platform style are NOT contradictions.
+3. Only report ACTUAL FACTUAL INCONSISTENCIES where one channel claims fact X and another channel claims incompatible fact Y.
+4. For each contradiction found, determine severity:
+   - 'high': Direct numerical, date, or factual contradiction (e.g., 500 vs 5,000 students, different deadlines).
+   - 'medium': Substantial discrepancy in eligibility or scope.
+   - 'low': Minor factual variance or ambiguity across outputs.
+
+CHANNELS AND CLAIMS:
+${summaries}
+
+Return ONLY valid JSON matching this schema:
+{
+  "contradictions": [
+    {
+      "topic": "string (e.g., Application Deadline)",
+      "severity": "high" | "medium" | "low",
+      "description": "string describing the contradiction",
+      "outputAType": "instagram" | "youtube" | "linkedin" | "blog" | "whatsapp" | "twitter",
+      "outputAText": "string quote from output A",
+      "outputBType": "instagram" | "youtube" | "linkedin" | "blog" | "whatsapp" | "twitter",
+      "outputBText": "string quote from output B",
+      "suggestedFix": "string recommended resolution"
+    }
+  ]
+}`;
+
+    const { response } = await callGeminiWithModelFallback(
+      this.client,
+      {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        config: {
+          responseMimeType: 'application/json',
+          temperature: 0.1
+        }
+      },
+      this.apiKey || '',
+      text => {
+        parseStructuredJson(text, crossConsistencySchema);
+      }
+    );
+
+    const parsed = parseStructuredJson<{
+      contradictions: Array<{
+        topic: string;
+        severity: 'high' | 'medium' | 'low';
+        description: string;
+        outputAType: OutputType;
+        outputAText: string;
+        outputBType: OutputType;
+        outputBText: string;
+        suggestedFix: string;
+      }>;
+    }>(response.text || '', crossConsistencySchema);
+
+    return parsed.contradictions.map((c, idx) => ({
+      id: `contra-${Date.now()}-${idx}`,
+      topic: c.topic,
+      severity: c.severity,
+      description: c.description,
+      outputA: { type: c.outputAType, text: c.outputAText },
+      outputB: { type: c.outputBType, text: c.outputBText },
+      suggestedFix: c.suggestedFix,
+      resolved: false
+    }));
+  }
+
+  /**
+   * C3: Grounding and consistency verification orchestrator with real deterministic scoring.
    */
   async verifyGroundednessAndConsistency(
     sot: SourceOfTruth,
     spans: SourceSpan[],
     outputs: OutputItem[]
-  ): Promise<VerificationResult> {
+  ): Promise<{
+    verification: VerificationResult;
+    verifiedOutputs: OutputItem[];
+  }> {
+    if (!this.client) {
+      throw new Error('Gemini API key is not configured; cannot perform verification.');
+    }
+
+    // 1. Verify claims for each output in batch
+    const verifiedOutputs: OutputItem[] = [];
+    for (const output of outputs) {
+      const verifiedClaims = await this.verifyOutputClaims(output, spans);
+
+      const outputTotal = verifiedClaims.length;
+      const outputSupported = verifiedClaims.filter(c => c.status === 'supported').length;
+      const outputGroundingPercent = outputTotal > 0
+        ? Math.round((outputSupported / outputTotal) * 100)
+        : null;
+
+      verifiedOutputs.push({
+        ...output,
+        claims: verifiedClaims,
+        groundedPercent: outputGroundingPercent,
+        qualityScore: outputGroundingPercent
+      });
+    }
+
+    // 2. Cross-output consistency check
+    let contradictions: ContradictionItem[] = [];
+    if (outputs.length >= 2) {
+      try {
+        contradictions = await this.verifyCrossOutputConsistency(verifiedOutputs);
+      } catch (err) {
+        console.warn('Cross-output consistency check warning: ' + sanitizedError(err, this.apiKey || ''));
+        contradictions = [];
+      }
+    }
+
+    // Mark contradiction flags on matching claims
+    for (const contra of contradictions) {
+      for (const vo of verifiedOutputs) {
+        if (vo.outputType === contra.outputA.type || vo.outputType === contra.outputB.type) {
+          for (const cl of vo.claims) {
+            if (
+              cl.claimText.toLowerCase().includes(contra.topic.toLowerCase()) ||
+              contra.description.toLowerCase().includes(cl.claimText.toLowerCase())
+            ) {
+              cl.contradictionFlag = true;
+              cl.contradictionDetails = contra.description;
+            }
+          }
+        }
+      }
+    }
+
+    // 3. Deterministic scoring
+    const allClaims = verifiedOutputs.flatMap(o => o.claims || []);
+    const totalClaimsCount = allClaims.length;
+    const groundedClaimsCount = allClaims.filter(c => c.status === 'supported').length;
+    const partialClaimsCount = allClaims.filter(c => c.status === 'partial').length;
+    const unsupportedClaimsCount = allClaims.filter(c => c.status === 'unsupported').length;
+
+    let groundingRate: number | null = null;
+    let status: 'verified' | 'unverified' | 'insufficient_evidence' = 'verified';
+
+    if (totalClaimsCount === 0) {
+      status = 'insufficient_evidence';
+      groundingRate = null;
+    } else {
+      // Deterministic formula:
+      // groundingRate = supported claims / all assessed factual claims * 100
+      groundingRate = Math.round((groundedClaimsCount / totalClaimsCount) * 100);
+    }
+
+    let overallConsistencyScore: number | null = null;
+    if (outputs.length < 2) {
+      overallConsistencyScore = 100;
+    } else {
+      const highCount = contradictions.filter(c => c.severity === 'high').length;
+      const medCount = contradictions.filter(c => c.severity === 'medium').length;
+      const lowCount = contradictions.filter(c => c.severity === 'low').length;
+      const penalty = (highCount * 25) + (medCount * 15) + (lowCount * 5);
+      overallConsistencyScore = Math.max(0, 100 - penalty);
+    }
+
+    const verification: VerificationResult = {
+      overallConsistencyScore,
+      groundingRate,
+      groundedClaimsCount,
+      partialClaimsCount,
+      unsupportedClaimsCount,
+      totalClaimsCount,
+      contradictions,
+      verifiedAt: new Date().toISOString(),
+      status
+    };
+
     return {
-      overallConsistencyScore: 98,
-      groundingRate: 98.6,
-      groundedClaimsCount: outputs.reduce((acc, o) => acc + (o.claims?.length || 0), 0) || 12,
-      totalClaimsCount: outputs.reduce((acc, o) => acc + (o.claims?.length || 0), 0) || 12,
-      contradictions: [],
-      verifiedAt: new Date().toISOString()
+      verification,
+      verifiedOutputs
     };
   }
 }

@@ -1,16 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { GeminiPipelineService } from '@/lib/gemini';
 import { OutputType, SourceOfTruth, TransformConfig, SourceSpan } from '@/types';
+import { getGeminiApiKey, sanitizeSecretOutput } from '@/lib/env';
 
 export async function POST(req: NextRequest) {
   try {
-    const { sot, spans, config, selectedTypes, apiKey } = await req.json();
+    const { sot, spans, config, selectedTypes } = await req.json();
 
     if (!sot || !selectedTypes || selectedTypes.length === 0) {
       return NextResponse.json({ error: 'Source of Truth and selected output types are required' }, { status: 400 });
     }
 
-    const service = new GeminiPipelineService(apiKey);
+    const geminiApiKey = getGeminiApiKey();
+    const service = new GeminiPipelineService(geminiApiKey);
     const outputs = await service.generateCoordinatedOutputs(
       sot as SourceOfTruth,
       (spans || []) as SourceSpan[],
@@ -20,9 +22,10 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ outputs });
   } catch (error: any) {
-    console.error('Generate route error:', error);
+    const cleanMessage = sanitizeSecretOutput(error.message || 'Failed to generate coordinated outputs');
+    console.error('Generate route error:', cleanMessage);
     return NextResponse.json(
-      { error: 'Failed to generate coordinated outputs', details: error.message },
+      { error: cleanMessage },
       { status: 500 }
     );
   }

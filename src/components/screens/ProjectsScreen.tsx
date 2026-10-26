@@ -113,7 +113,7 @@ export const ProjectsScreen: React.FC = () => {
                       {p.status}
                     </span>
                     <span className="text-xs font-bold text-[#477A3C] font-mono">
-                      {p.qualityScore}% Quality
+                      {p.qualityScore != null ? `${p.qualityScore}% Quality` : 'Not verified'}
                     </span>
                   </div>
 

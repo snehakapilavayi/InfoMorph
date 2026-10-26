@@ -9,7 +9,8 @@ import {
   ProjectItem,
   SourceOfTruth,
   QuestionnairePreferences,
-  AuditLog
+  AuditLog,
+  VerificationResult
 } from '@/types';
 import { DEFAULT_PREFERENCES } from '@/lib/mockData';
 import { tokenizeTextIntoSpans } from '@/lib/tokenizer';
@@ -56,6 +57,12 @@ interface AppContextType {
   auditLogs: AuditLog[];
   selectedSpanId: string | null;
   setSelectedSpanId: (spanId: string | null) => void;
+  generationError: string | null;
+  setGenerationError: (err: string | null) => void;
+  isVerifying: boolean;
+  verificationResult: VerificationResult | null;
+  verificationError: string | null;
+  verifyOutputs: () => Promise<void>;
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
@@ -73,6 +80,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [toasts, setToasts] = useState<ToastState[]>([]);
   const [selectedSpanId, setSelectedSpanId] = useState<string | null>(null);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
+  const [generationError, setGenerationError] = useState<string | null>(null);
+  const [isVerifying, setIsVerifying] = useState(false);
+  const [verificationResult, setVerificationResult] = useState<VerificationResult | null>(null);
+  const [verificationError, setVerificationError] = useState<string | null>(null);
 
   // On initial mount, optionally load existing records from Supabase
   useEffect(() => {
@@ -131,6 +142,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setProjects([]);
     setSot(null);
     setAuditLogs([]);
+    setGenerationError(null);
     setActiveNav('new_chat');
 
     // Wipe rows from Supabase if connected
@@ -263,7 +275,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     setIsGenerating(true);
-    addToast('Generating grounded content with Gemini 3.6 Flash...', 'info');
+    setGenerationError(null);
+    addToast('Generating grounded content with Gemini...', 'info');
 
     try {
       let currentSot = sot;
@@ -304,16 +317,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       setOutputs(generatedOutputs);
       setActiveOutput(generatedOutputs[0]);
+      setGenerationError(null);
 
       // Save to Supabase
       await saveGeneratedOutputs(generatedOutputs, undefined, activeSource.id);
 
       // Audit Log
+      const modelLabel = generatedOutputs[0]?.modelUsed
+        ? String(generatedOutputs[0].modelUsed).replace(/^models\//, '')
+        : 'Gemini';
       const log = {
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         category: 'generation' as const,
         action: 'Outputs Formatted & Grounded',
-        details: `Generated ${generatedOutputs.length} channels with Gemini 3.6 Flash. Grounding verified against "${activeSource.name}".`,
+        details: `Generated ${generatedOutputs.length} channels with ${modelLabel}. Grounding verified against "${activeSource.name}".`,
         status: 'success' as const
       };
       setAuditLogs(prev => [{ id: `log-${Date.now()}`, ...log }, ...prev]);
@@ -323,9 +340,69 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setActiveNav('outputs');
     } catch (err: any) {
       console.error('Generation failure:', err);
-      addToast(err.message || 'Generation failed', 'warning');
+      const errMsg = err.message || 'Generation failed';
+      setGenerationError(errMsg);
+      addToast(errMsg, 'warning');
+      setActiveNav('outputs');
     } finally {
       setIsGenerating(false);
+    }
+  };
+
+  const verifyOutputs = async () => {
+    if (!outputs || outputs.length === 0) {
+      addToast('No generated outputs available to verify', 'warning');
+      return;
+    }
+
+    setIsVerifying(true);
+    setVerificationError(null);
+    addToast('Verifying factual claims against source evidence...', 'info');
+
+    try {
+      const res = await fetch('/api/pipeline/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sot,
+          spans: activeSource?.spans || [],
+          outputs
+        })
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Verification failed');
+      }
+
+      const { verification, verifiedOutputs } = data;
+      setVerificationResult(verification);
+      if (verifiedOutputs && verifiedOutputs.length > 0) {
+        setOutputs(verifiedOutputs);
+        if (activeOutput) {
+          const matching = verifiedOutputs.find((o: OutputItem) => o.id === activeOutput.id);
+          if (matching) setActiveOutput(matching);
+        }
+      }
+
+      const log = {
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        category: 'verification' as const,
+        action: 'Claims Grounding Verified',
+        details: `Assessed ${verification.totalClaimsCount} claims: ${verification.groundedClaimsCount} supported, ${verification.partialClaimsCount || 0} partial, ${verification.unsupportedClaimsCount || 0} unsupported. Grounding: ${verification.groundingRate}%, Consistency: ${verification.overallConsistencyScore}%.`,
+        status: 'success' as const
+      };
+      setAuditLogs(prev => [{ id: `log-${Date.now()}`, ...log }, ...prev]);
+      await logAuditEventToSupabase(log);
+
+      addToast(`Verified ${verification.totalClaimsCount} claims (${verification.groundingRate}% grounding)`, 'success');
+    } catch (err: any) {
+      console.error('Verification error:', err);
+      const errMsg = err.message || 'Verification failed';
+      setVerificationError(errMsg);
+      addToast(`Verification failed: ${errMsg}`, 'warning');
+    } finally {
+      setIsVerifying(false);
     }
   };
 
@@ -358,7 +435,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         addToast,
         auditLogs,
         selectedSpanId,
-        setSelectedSpanId
+        setSelectedSpanId,
+        generationError,
+        setGenerationError,
+        isVerifying,
+        verificationResult,
+        verificationError,
+        verifyOutputs
       }}
     >
       {children}

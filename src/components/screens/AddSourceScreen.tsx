@@ -24,18 +24,51 @@ export const AddSourceScreen: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleSubmitText = async () => {
-    if (!inputText.trim()) {
+    const trimmed = inputText.trim();
+    if (!trimmed) {
       addToast('Please enter text or upload a document to proceed', 'warning');
+      return;
+    }
+
+    // Check if the user pasted a single public URL
+    if (/^https?:\/\/[^\s]+$/i.test(trimmed)) {
+      setIsUploading(true);
+      addToast('Fetching and extracting clean webpage content...', 'info');
+      try {
+        const res = await fetch('/api/url/extract', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: trimmed })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || 'Failed to extract content from URL');
+        }
+        await addSourceToCorpus({
+          name: data.title ? `${data.title.substring(0, 45)}...` : trimmed.replace(/^https?:\/\//, '').substring(0, 30),
+          fileType: 'url',
+          size: `${Math.round((data.text.length / 1024) * 10) / 10 || 0.4} KB`,
+          pages: `${Math.max(1, Math.round(data.wordCount / 300))} pages`,
+          isPrimary: true,
+          rawText: data.text
+        });
+        setInputText('');
+        addToast(`Successfully extracted ${data.wordCount} words from webpage`, 'success');
+      } catch (err: any) {
+        addToast(err.message || 'Failed to extract URL', 'warning');
+      } finally {
+        setIsUploading(false);
+      }
       return;
     }
 
     await addSourceToCorpus({
       name: 'Custom Document Source.txt',
       fileType: 'txt',
-      size: `${Math.round(inputText.length / 1024 * 10) / 10 || 0.4} KB`,
-      pages: `${Math.max(1, Math.round(inputText.length / 1800))} pages`,
+      size: `${Math.round(trimmed.length / 1024 * 10) / 10 || 0.4} KB`,
+      pages: `${Math.max(1, Math.round(trimmed.length / 1800))} pages`,
       isPrimary: true,
-      rawText: inputText.trim()
+      rawText: trimmed
     });
     setInputText('');
   };
@@ -129,18 +162,37 @@ Regulatory interoperability standards between central bank digital currencies (C
     addToast(`Sample "${exampleName}" inserted into prompt box. Press the green arrow to start!`, 'info');
   };
 
-  const handleAddLink = () => {
-    if (!linkUrl.trim()) return;
-    addSourceToCorpus({
-      name: linkUrl.replace(/^https?:\/\//, '').substring(0, 30),
-      fileType: 'url',
-      size: 'Web Resource',
-      pages: 'Online Page',
-      isPrimary: true,
-      rawText: `Web source scraped from ${linkUrl}:\n\nPrimary article body indexed with semantic grounding.`
-    });
-    setShowLinkModal(false);
-    setLinkUrl('');
+  const handleAddLink = async () => {
+    const trimmed = linkUrl.trim();
+    if (!trimmed) return;
+    setIsUploading(true);
+    addToast('Extracting clean article content from URL...', 'info');
+    try {
+      const res = await fetch('/api/url/extract', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: trimmed })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to extract content from URL');
+      }
+      await addSourceToCorpus({
+        name: data.title ? `${data.title.substring(0, 45)}...` : trimmed.replace(/^https?:\/\//, '').substring(0, 30),
+        fileType: 'url',
+        size: `${Math.round((data.text.length / 1024) * 10) / 10 || 0.4} KB`,
+        pages: `${Math.max(1, Math.round(data.wordCount / 300))} pages`,
+        isPrimary: true,
+        rawText: data.text
+      });
+      setShowLinkModal(false);
+      setLinkUrl('');
+      addToast(`Successfully ingested web resource (${data.wordCount} words)`, 'success');
+    } catch (err: any) {
+      addToast(err.message || 'Failed to process URL', 'warning');
+    } finally {
+      setIsUploading(false);
+    }
   };
 
   return (

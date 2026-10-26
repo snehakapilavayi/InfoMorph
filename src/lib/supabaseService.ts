@@ -29,7 +29,7 @@ export async function getProjects(): Promise<ProjectItem[] | null> {
     description: row.description || '',
     primarySource: row.primary_source || '',
     outputsCount: row.outputs_count || 0,
-    qualityScore: Number(row.quality_score) || 98,
+    qualityScore: row.quality_score !== null && row.quality_score !== undefined ? Number(row.quality_score) : null,
     lastUpdated: row.updated_at ? new Date(row.updated_at).toLocaleDateString() : 'Today',
     status: row.status as 'Completed' | 'In Progress' | 'Draft'
   }));

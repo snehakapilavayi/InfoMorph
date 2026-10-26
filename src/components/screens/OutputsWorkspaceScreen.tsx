@@ -18,6 +18,10 @@ import {
   Send,
   ExternalLink,
   ShieldCheck,
+  ShieldAlert,
+  AlertCircle,
+  AlertTriangle,
+  RotateCcw,
   Image as ImageIcon,
   Radio,
   Video,
@@ -36,12 +40,19 @@ export const OutputsWorkspaceScreen: React.FC = () => {
     updateOutputContent,
     copyOutput,
     publishOutput,
-    setActiveNav
+    setActiveNav,
+    generationError,
+    isGenerating,
+    startGeneration,
+    isVerifying,
+    verificationResult,
+    verificationError,
+    verifyOutputs
   } = useApp();
 
   const [isEditing, setIsEditing] = useState(false);
   const [editedText, setEditedText] = useState(activeOutput?.content || '');
-  const [viewMode, setViewMode] = useState<'text' | 'image' | 'audio' | 'video'>('text');
+  const [viewMode, setViewMode] = useState<'text' | 'image' | 'audio' | 'video' | 'claims'>('text');
 
   // Keep edited text & default viewMode in sync when activeOutput changes
   React.useEffect(() => {
@@ -57,6 +68,36 @@ export const OutputsWorkspaceScreen: React.FC = () => {
       }
     }
   }, [activeOutput?.id]);
+
+  if (generationError && (!activeOutput || outputs.length === 0)) {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center p-8 text-center bg-[#F8FAF7] min-h-[calc(100vh-4rem)]">
+        <div className="w-16 h-16 rounded-2xl bg-rose-50 border border-rose-200 flex items-center justify-center text-rose-600 mb-4 shadow-sm">
+          <AlertCircle className="w-8 h-8" />
+        </div>
+        <h3 className="text-xl font-bold text-[#172019] mb-2">Generation Failed</h3>
+        <p className="text-xs text-rose-800 bg-rose-50 border border-rose-200 rounded-xl px-4 py-3 max-w-xl mb-6 leading-relaxed font-mono">
+          {generationError}
+        </p>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => startGeneration()}
+            disabled={isGenerating}
+            className="inline-flex items-center gap-2 px-5 py-2.5 bg-[#477A3C] hover:bg-[#3A6331] disabled:opacity-50 text-white rounded-xl text-xs font-semibold tracking-wide transition shadow-sm cursor-pointer"
+          >
+            <RotateCcw className={`w-4 h-4 ${isGenerating ? 'animate-spin' : ''}`} />
+            <span>{isGenerating ? 'Retrying...' : 'Retry Generation'}</span>
+          </button>
+          <button
+            onClick={() => setActiveNav('new_chat')}
+            className="inline-flex items-center gap-2 px-4 py-2.5 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 rounded-xl text-xs font-semibold tracking-wide transition shadow-sm cursor-pointer"
+          >
+            <span>Back to Source</span>
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   if (!activeOutput || outputs.length === 0) {
     return (
@@ -171,15 +212,51 @@ export const OutputsWorkspaceScreen: React.FC = () => {
               <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium bg-emerald-50 text-emerald-700 border border-emerald-200">
                 Completed
               </span>
+              <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium bg-slate-100 text-slate-700 border border-slate-200">
+                {activeOutput.modelUsed ? activeOutput.modelUsed.replace(/^models\//, '') : 'Gemini-powered'}
+              </span>
             </div>
           </div>
         </div>
 
-        {/* Action Button */}
-        <div className="flex items-center gap-4">
+        {/* Action Buttons */}
+        <div className="flex items-center gap-3">
+          {verificationResult && (
+            <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200">
+              <ShieldCheck className="w-4 h-4 text-[#477A3C]" />
+              <span>
+                {verificationResult.groundingRate != null
+                  ? `${verificationResult.groundingRate}% Grounded`
+                  : 'Assessed'}
+              </span>
+              <span className="text-gray-300">•</span>
+              <span className="text-[11px] text-emerald-700 font-normal">
+                {verificationResult.groundedClaimsCount}/{verificationResult.totalClaimsCount} supported
+              </span>
+            </div>
+          )}
+
+          {verificationError && (
+            <div className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold bg-rose-50 text-rose-800 border border-rose-200">
+              <AlertCircle className="w-3.5 h-3.5 text-rose-600" />
+              <span>Verification Unsuccessful</span>
+            </div>
+          )}
+
+          <button
+            onClick={() => verifyOutputs()}
+            disabled={isVerifying || outputs.length === 0}
+            className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold bg-white border border-[#8DBF67] hover:bg-[#F2F8EF] text-[#3A6331] shadow-2xs transition disabled:opacity-50 cursor-pointer"
+            type="button"
+          >
+            <ShieldCheck className={`w-3.5 h-3.5 ${isVerifying ? 'animate-spin' : 'text-[#477A3C]'}`} />
+            <span>{isVerifying ? 'Verifying Claims...' : 'Verify Claims'}</span>
+          </button>
+
           <button
             onClick={() => setActiveNav('publish')}
-            className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold bg-[#477A3C] hover:bg-[#3A6331] text-white shadow-sm transition"
+            className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold bg-[#477A3C] hover:bg-[#3A6331] text-white shadow-sm transition cursor-pointer"
+            type="button"
           >
             <span>Go to Publish</span>
             <Share2 className="w-3.5 h-3.5" />
@@ -224,9 +301,16 @@ export const OutputsWorkspaceScreen: React.FC = () => {
                           {out.title}
                         </h3>
                       </div>
-                      {isSelected && (
-                        <span className="w-2 h-2 rounded-full bg-[#477A3C]" />
-                      )}
+                      <div className="flex items-center gap-1.5">
+                        {out.isFallback && (
+                          <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-100 text-amber-800 border border-amber-200">
+                            Fallback
+                          </span>
+                        )}
+                        {isSelected && (
+                          <span className="w-2 h-2 rounded-full bg-[#477A3C]" />
+                        )}
+                      </div>
                     </div>
                     <p className="text-xs text-slate-500 mt-2 line-clamp-2">
                       {out.subtitle}
@@ -241,9 +325,15 @@ export const OutputsWorkspaceScreen: React.FC = () => {
                     >
                       {isSelected ? 'Viewing' : 'Score'}
                     </span>
-                    <span className="text-xs font-bold text-[#477A3C]">
-                      {out.qualityScore}%
-                    </span>
+                    {out.qualityScore != null && !out.isFallback ? (
+                      <span className="text-xs font-bold text-[#477A3C]">
+                        {out.qualityScore}%
+                      </span>
+                    ) : (
+                      <span className="text-xs font-medium text-slate-400">
+                        Not verified
+                      </span>
+                    )}
                   </div>
                 </article>
               );
@@ -264,6 +354,16 @@ export const OutputsWorkspaceScreen: React.FC = () => {
               <span className="text-base font-bold text-slate-900">
                 {activeOutput.title}
               </span>
+              {activeOutput.isFallback && (
+                <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-amber-100 text-amber-800 border border-amber-200">
+                  Fallback
+                </span>
+              )}
+              {activeOutput.modelUsed && (
+                <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-slate-100 text-slate-600 border border-slate-200">
+                  {activeOutput.modelUsed.replace(/^models\//, '')}
+                </span>
+              )}
             </div>
 
             {/* Action Buttons */}
@@ -304,6 +404,17 @@ export const OutputsWorkspaceScreen: React.FC = () => {
               </button>
             </div>
           </div>
+
+          {/* Amber Fallback Banner */}
+          {activeOutput.isFallback && (
+            <div className="mx-6 my-3 p-3 bg-amber-50 border border-amber-200/80 rounded-xl flex items-start gap-2.5 text-xs text-amber-900 shadow-2xs">
+              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+              <div>
+                <span className="font-semibold">Fallback Mode Active:</span>{' '}
+                <span>{activeOutput.fallbackReason || 'Generated using fallback pipeline. Scores unverified.'}</span>
+              </div>
+            </div>
+          )}
 
           {/* Multi-Modal Tab Navigation */}
           <div className="px-6 py-2.5 border-b border-[#F0F1F3] bg-[#FAFDF9] flex items-center gap-2 overflow-x-auto">
@@ -355,9 +466,211 @@ export const OutputsWorkspaceScreen: React.FC = () => {
               <Video className="w-3.5 h-3.5" />
               <span>Video Studio</span>
             </button>
+            <button
+              onClick={() => setViewMode('claims')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer ${
+                viewMode === 'claims'
+                  ? 'bg-[#477A3C] text-white shadow-xs'
+                  : 'text-gray-600 hover:text-gray-900 hover:bg-white'
+              }`}
+              type="button"
+            >
+              <ShieldCheck className="w-3.5 h-3.5" />
+              <span>Claims &amp; Grounding ({activeOutput.claims?.length || 0})</span>
+            </button>
           </div>
 
           {/* Conditional Multi-Modal Renderers */}
+          {viewMode === 'claims' && (
+            <div className="p-6 space-y-6 max-h-[600px] overflow-y-auto">
+              {/* Contradiction Warnings if present */}
+              {verificationResult?.contradictions && verificationResult.contradictions.length > 0 && (
+                <div className="space-y-3">
+                  <h4 className="text-xs font-bold uppercase tracking-wider text-rose-700 flex items-center gap-1.5">
+                    <AlertTriangle className="w-4 h-4 text-rose-600" />
+                    Cross-Output Inconsistencies Detected ({verificationResult.contradictions.length})
+                  </h4>
+                  {verificationResult.contradictions.map((c) => (
+                    <div
+                      key={c.id}
+                      className="p-3.5 rounded-xl border border-rose-200 bg-rose-50/60 text-xs text-rose-950 space-y-2"
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="font-bold text-rose-900">{c.topic}</span>
+                        <span
+                          className={`text-[10px] px-2 py-0.5 rounded-full font-semibold uppercase ${
+                            c.severity === 'high'
+                              ? 'bg-rose-200 text-rose-800'
+                              : c.severity === 'medium'
+                              ? 'bg-amber-200 text-amber-900'
+                              : 'bg-blue-100 text-blue-800'
+                          }`}
+                        >
+                          {c.severity} Severity
+                        </span>
+                      </div>
+                      <p className="text-rose-900/90 leading-relaxed">{c.description}</p>
+                      <div className="grid grid-cols-2 gap-2 text-[11px] pt-1">
+                        <div className="p-2 bg-white/80 rounded-lg border border-rose-200/60">
+                          <span className="font-bold uppercase text-[9px] text-gray-500 block">
+                            {c.outputA.type}
+                          </span>
+                          <span className="italic">"{c.outputA.text}"</span>
+                        </div>
+                        <div className="p-2 bg-white/80 rounded-lg border border-rose-200/60">
+                          <span className="font-bold uppercase text-[9px] text-gray-500 block">
+                            {c.outputB.type}
+                          </span>
+                          <span className="italic">"{c.outputB.text}"</span>
+                        </div>
+                      </div>
+                      <div className="text-[11px] bg-white/90 p-2 rounded-lg border border-rose-200/80 font-medium text-emerald-900">
+                        <span className="font-bold text-emerald-700">Recommended Fix: </span>
+                        {c.suggestedFix}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Channel Stats Overview */}
+              <div className="grid grid-cols-4 gap-2">
+                <div className="p-3 rounded-xl bg-[#F8FAF7] border border-[#DCE7D9] text-center">
+                  <span className="text-[10px] uppercase font-semibold text-gray-500 block">Total Claims</span>
+                  <span className="text-base font-bold text-gray-800 font-mono">
+                    {activeOutput.claims?.length || 0}
+                  </span>
+                </div>
+                <div className="p-3 rounded-xl bg-emerald-50/60 border border-emerald-200 text-center">
+                  <span className="text-[10px] uppercase font-semibold text-emerald-800 block">Supported</span>
+                  <span className="text-base font-bold text-emerald-700 font-mono">
+                    {activeOutput.claims?.filter(c => c.status === 'supported').length || 0}
+                  </span>
+                </div>
+                <div className="p-3 rounded-xl bg-amber-50/60 border border-amber-200 text-center">
+                  <span className="text-[10px] uppercase font-semibold text-amber-800 block">Partial</span>
+                  <span className="text-base font-bold text-amber-700 font-mono">
+                    {activeOutput.claims?.filter(c => c.status === 'partial').length || 0}
+                  </span>
+                </div>
+                <div className="p-3 rounded-xl bg-rose-50/60 border border-rose-200 text-center">
+                  <span className="text-[10px] uppercase font-semibold text-rose-800 block">Unsupported</span>
+                  <span className="text-base font-bold text-rose-700 font-mono">
+                    {activeOutput.claims?.filter(c => c.status === 'unsupported').length || 0}
+                  </span>
+                </div>
+              </div>
+
+              {/* Claims List */}
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <h4 className="text-xs font-bold uppercase tracking-wider text-gray-600">
+                    Assessed Factual Statements ({activeOutput.claims?.length || 0})
+                  </h4>
+                  {activeOutput.groundedPercent != null ? (
+                    <span className="text-[#477A3C] font-mono font-bold text-xs">
+                      {activeOutput.groundedPercent}% Grounded
+                    </span>
+                  ) : (
+                    <button
+                      onClick={() => verifyOutputs()}
+                      disabled={isVerifying}
+                      className="text-[11px] text-[#477A3C] font-semibold hover:underline cursor-pointer"
+                    >
+                      Run Grounding Verification
+                    </button>
+                  )}
+                </div>
+
+                {(!activeOutput.claims || activeOutput.claims.length === 0) ? (
+                  <p className="text-xs text-gray-400 text-center py-6">
+                    No individual claims registered for this output.
+                  </p>
+                ) : (
+                  activeOutput.claims.map((claim, idx) => (
+                    <div
+                      key={claim.id || idx}
+                      className={`p-3.5 rounded-xl border text-xs space-y-2 ${
+                        claim.status === 'supported'
+                          ? 'border-emerald-200 bg-emerald-50/30'
+                          : claim.status === 'partial'
+                          ? 'border-amber-200 bg-amber-50/30'
+                          : claim.status === 'unsupported'
+                          ? 'border-rose-200 bg-rose-50/30'
+                          : 'border-slate-200 bg-white'
+                      }`}
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <p className="font-semibold text-gray-900 leading-snug">
+                          "{claim.claimText}"
+                        </p>
+                        <div>
+                          {claim.status === 'supported' ? (
+                            <span className="inline-flex items-center gap-1 text-[10px] font-bold text-emerald-800 bg-emerald-100 px-2 py-0.5 rounded-full whitespace-nowrap">
+                              <CheckCircle2 className="w-3 h-3 text-emerald-700" /> Supported
+                            </span>
+                          ) : claim.status === 'partial' ? (
+                            <span className="inline-flex items-center gap-1 text-[10px] font-bold text-amber-800 bg-amber-100 px-2 py-0.5 rounded-full whitespace-nowrap">
+                              <AlertTriangle className="w-3 h-3 text-amber-700" /> Partial Support
+                            </span>
+                          ) : claim.status === 'unsupported' ? (
+                            <span className="inline-flex items-center gap-1 text-[10px] font-bold text-rose-800 bg-rose-100 px-2 py-0.5 rounded-full whitespace-nowrap">
+                              <AlertCircle className="w-3 h-3 text-rose-700" /> Unsupported
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 text-[10px] font-medium text-slate-500 bg-slate-100 px-2 py-0.5 rounded-full whitespace-nowrap">
+                              <ShieldAlert className="w-3 h-3 text-slate-400" /> Unverified
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Cited Spans */}
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span className="text-[10px] font-bold uppercase text-gray-400">Cited Evidence:</span>
+                        {claim.sourceSpanIds && claim.sourceSpanIds.length > 0 ? (
+                          claim.sourceSpanIds.map((sid) => (
+                            <span
+                              key={sid}
+                              className="inline-block px-1.5 py-0.2 bg-white border border-[#DCE7D9] rounded font-mono text-[10px] text-[#477A3C] font-semibold"
+                            >
+                              {sid}
+                            </span>
+                          ))
+                        ) : (
+                          <span className="text-[10px] italic text-rose-600 font-medium">None cited</span>
+                        )}
+                      </div>
+
+                      {/* Model Grounding Explanation */}
+                      {claim.explanation && (
+                        <p className="text-[11px] text-gray-700 bg-white/80 p-2 rounded-lg border border-gray-100 leading-relaxed font-sans">
+                          <span className="font-semibold text-gray-900">Verdict: </span>
+                          {claim.explanation}
+                        </p>
+                      )}
+
+                      {/* Source Ambiguity Notice */}
+                      {claim.sourceAmbiguity && (
+                        <div className="p-2 rounded-lg bg-amber-100/70 border border-amber-300 text-[11px] text-amber-900 font-medium flex items-center gap-1.5">
+                          <AlertTriangle className="w-3.5 h-3.5 text-amber-700 shrink-0" />
+                          <span>Source Ambiguity: The source contains conflicting figures on this point.</span>
+                        </div>
+                      )}
+
+                      {/* Suggested Correction */}
+                      {claim.suggestedCorrection && (
+                        <div className="p-2 rounded-lg bg-emerald-50/80 border border-emerald-200 text-[11px] text-emerald-900 font-medium">
+                          <span className="font-bold text-emerald-800">Suggested Correction: </span>
+                          {claim.suggestedCorrection}
+                        </div>
+                      )}
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          )}
           {viewMode === 'image' && (
             <div className="p-6">
               <PostImageCard
@@ -448,8 +761,17 @@ export const OutputsWorkspaceScreen: React.FC = () => {
               Characters: {activeOutput.characterCount}
             </span>
             <div className="flex items-center gap-1.5 font-semibold text-[#477A3C]">
-              <CheckCircle2 className="w-4 h-4 text-[#477A3C]" />
-              <span>{activeOutput.groundedPercent}% Grounded</span>
+              {activeOutput.groundedPercent != null && !activeOutput.isFallback ? (
+                <>
+                  <CheckCircle2 className="w-4 h-4 text-[#477A3C]" />
+                  <span>{activeOutput.groundedPercent}% Grounded</span>
+                </>
+              ) : (
+                <>
+                  <ShieldAlert className="w-4 h-4 text-slate-400" />
+                  <span className="text-slate-500 font-medium">Not verified</span>
+                </>
+              )}
             </div>
           </div>
         </section>

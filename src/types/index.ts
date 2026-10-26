@@ -76,6 +76,10 @@ export interface ClaimItem {
   grounded: boolean;
   contradictionFlag: boolean;
   contradictionDetails?: string;
+  status?: 'supported' | 'partial' | 'unsupported';
+  explanation?: string;
+  suggestedCorrection?: string;
+  sourceAmbiguity?: boolean;
 }
 
 export interface ContradictionItem {
@@ -90,12 +94,16 @@ export interface ContradictionItem {
 }
 
 export interface VerificationResult {
-  overallConsistencyScore: number;
-  groundingRate: number;
+  overallConsistencyScore?: number | null;
+  groundingRate?: number | null;
   groundedClaimsCount: number;
+  partialClaimsCount?: number;
+  unsupportedClaimsCount?: number;
   totalClaimsCount: number;
   contradictions: ContradictionItem[];
   verifiedAt: string;
+  status?: 'verified' | 'unverified' | 'insufficient_evidence' | 'error';
+  errorMessage?: string;
 }
 
 export interface StoryboardScene {
@@ -111,9 +119,9 @@ export interface OutputItem {
   title: string;
   subtitle: string;
   content: string;
-  qualityScore: number;
+  qualityScore?: number | null;
   characterCount: number;
-  groundedPercent: number;
+  groundedPercent?: number | null;
   status: 'ready' | 'published' | 'draft' | 'under_review';
   publishedAt?: string;
   claims: ClaimItem[];
@@ -124,6 +132,9 @@ export interface OutputItem {
   audioDuration?: string;
   videoDuration?: string;
   storyboard?: StoryboardScene[];
+  isFallback?: boolean;
+  fallbackReason?: string;
+  modelUsed?: string;
 }
 
 export interface ProjectItem {
@@ -132,7 +143,7 @@ export interface ProjectItem {
   description: string;
   primarySource: string;
   outputsCount: number;
-  qualityScore: number;
+  qualityScore?: number | null;
   lastUpdated: string;
   status: 'Completed' | 'In Progress' | 'Draft';
 }
